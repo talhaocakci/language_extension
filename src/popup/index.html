@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Subtitle Learning</title>
+  <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700&display=swap" rel="stylesheet">
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: 'Poppins', sans-serif;
+      width: 400px;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: #fff;
+    }
+
+    #root {
+      padding: 20px;
+    }
+  </style>
+</head>
+<body>
+  <div id="root">
+    <div style="padding: 20px; text-align: center; color: white;">
+      <h2>📚 Subtitle Learning</h2>
+      <p>Loading...</p>
+    </div>
+  </div>
+  <script src="index.js"></script>
+  <script>
+    // Fallback message if React fails
+    setTimeout(() => {
+      if (document.getElementById('root').innerHTML.includes('Loading')) {
+        document.getElementById('root').innerHTML = `
+          <div style="padding: 20px; text-align: center; color: white;">
+            <h2>⚠️ Error Loading</h2>
+            <p>Check console (F12) for errors</p>
+          </div>
+        `;
+      }
+    }, 3000);
+  </script>
+</body>
+</html>

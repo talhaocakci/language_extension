@@ -1,0 +1,328 @@
+@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700&display=swap');
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Poppins', sans-serif;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: #fff;
+  min-height: 100vh;
+}
+
+.popupApp {
+  width: 400px;
+  max-height: 600px;
+  display: flex;
+  flex-direction: column;
+  background: white;
+  color: #333;
+}
+
+.popupHeader {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  padding: 20px;
+  text-align: center;
+}
+
+.popupHeader h1 {
+  font-size: 24px;
+  margin-bottom: 4px;
+  font-weight: 700;
+}
+
+.subtitle {
+  font-size: 12px;
+  opacity: 0.9;
+  font-weight: 400;
+}
+
+.tabs {
+  display: flex;
+  border-bottom: 2px solid #f0f0f0;
+  background: #fafafa;
+}
+
+.tab {
+  flex: 1;
+  padding: 12px;
+  border: none;
+  background: transparent;
+  font-family: 'Poppins', sans-serif;
+  font-weight: 600;
+  font-size: 13px;
+  cursor: pointer;
+  color: #999;
+  transition: all 0.2s ease;
+}
+
+.tab.active {
+  color: #667eea;
+  border-bottom: 2px solid #667eea;
+  margin-bottom: -2px;
+}
+
+.tab:hover {
+  color: #667eea;
+}
+
+.tabContent {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px;
+}
+
+.statusTab .statusItem {
+  margin-bottom: 24px;
+}
+
+.statusTab h3 {
+  font-size: 16px;
+  margin-bottom: 10px;
+  color: #667eea;
+  font-weight: 700;
+}
+
+.statusTab p {
+  font-size: 13px;
+  color: #666;
+  line-height: 1.6;
+  margin-bottom: 10px;
+}
+
+.featureList {
+  list-style: none;
+  padding: 0;
+  margin: 10px 0;
+}
+
+.featureList li {
+  font-size: 12px;
+  color: #555;
+  padding: 6px 0;
+  padding-left: 20px;
+}
+
+.stepsList {
+  list-style: decimal;
+  padding-left: 20px;
+  margin: 10px 0;
+}
+
+.stepsList li {
+  font-size: 12px;
+  color: #555;
+  padding: 6px 0;
+  line-height: 1.5;
+}
+
+.settingsTab {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.settingGroup {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.settingGroup label {
+  font-weight: 600;
+  font-size: 12px;
+  color: #667eea;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.settingGroup input {
+  padding: 10px;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  font-family: 'Poppins', sans-serif;
+  font-size: 12px;
+  transition: all 0.2s ease;
+}
+
+.settingGroup input:focus {
+  outline: none;
+  border-color: #667eea;
+  box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+}
+
+.settingGroup small {
+  font-size: 11px;
+  color: #999;
+}
+
+.divider {
+  height: 1px;
+  background: #f0f0f0;
+  margin: 8px 0;
+}
+
+.saveButton {
+  padding: 12px;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  border: none;
+  border-radius: 6px;
+  font-family: 'Poppins', sans-serif;
+  font-weight: 600;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  margin-top: 10px;
+}
+
+.saveButton:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
+}
+
+.saveButton:active {
+  transform: translateY(0);
+}
+
+.saveMessage {
+  text-align: center;
+  padding: 10px;
+  background: #d4edda;
+  color: #155724;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+/* ── Auth card ──────────────────────────────────────────────────────────── */
+.authCard {
+  background: #f7f9ff;
+  border: 1px solid #e5e9ff;
+  border-radius: 10px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+
+.authLoading {
+  color: #667085;
+  font-size: 0.85rem;
+  text-align: center;
+}
+
+.authSignedIn .authInfo {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.authBadge {
+  background: #48bb78;
+  color: #fff;
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 12px;
+}
+
+.authEmail {
+  font-size: 0.88rem;
+  font-weight: 600;
+  color: #1f2937;
+  word-break: break-all;
+}
+
+.authExpiry {
+  font-size: 0.72rem;
+  color: #667085;
+  margin-bottom: 10px;
+}
+
+.authActions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.signOutBtn {
+  background: #ffffff;
+  color: #374151;
+  border: 1px solid #d0d7e8;
+  border-radius: 6px;
+  padding: 6px 14px;
+  font-size: 0.82rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.signOutBtn:hover:not(:disabled) {
+  background: #f3f5fb;
+}
+
+.signOutBtn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.authSignedOut .authPrompt {
+  font-size: 0.85rem;
+  color: #4b5563;
+  margin-bottom: 12px;
+}
+
+.signInBtn {
+  width: 100%;
+  background: linear-gradient(135deg, #48bb78, #38a169);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 10px;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.2s;
+}
+
+.signInBtn:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+.signInBtn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.signInAgainBtn {
+  width: auto;
+  background: linear-gradient(135deg, #667eea 0%, #5a67d8 100%);
+}
+
+.authError {
+  margin-top: 8px;
+  color: #dc2626;
+  font-size: 0.78rem;
+}
+
+/* ── scrollbar ──────────────────────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #f1f1f1;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #667eea;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #764ba2;
+}

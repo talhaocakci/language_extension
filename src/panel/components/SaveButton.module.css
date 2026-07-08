@@ -1,0 +1,98 @@
+.container {
+  background: linear-gradient(135deg, #fff5e6 0%, #ffe8cc 100%);
+  border: 2px solid #ffc107;
+  border-radius: 8px;
+  padding: 12px;
+  margin-top: 12px;
+  animation: slideUp 0.3s ease-out;
+}
+
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.selectedPhrase {
+  font-family: 'Poppins', sans-serif;
+  font-size: 12px;
+  color: #333;
+  margin-bottom: 10px;
+  padding: 8px;
+  background: white;
+  border-radius: 4px;
+  word-break: break-word;
+}
+
+.selectedPhrase strong {
+  color: #764ba2;
+  font-weight: 700;
+}
+
+.saveButton {
+  width: 100%;
+  padding: 10px;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  border: none;
+  border-radius: 6px;
+  font-family: 'Poppins', sans-serif;
+  font-weight: 700;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  margin-bottom: 8px;
+}
+
+.saveButton:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 16px rgba(102, 126, 234, 0.3);
+}
+
+.saveButton:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.saveButton:active {
+  transform: translateY(0);
+}
+
+.successMessage {
+  font-family: 'Poppins', sans-serif;
+  font-size: 12px;
+  color: #28a745;
+  background: #d4edda;
+  padding: 8px;
+  border-radius: 4px;
+  text-align: center;
+  font-weight: 600;
+  animation: fadeIn 0.2s ease-out;
+}
+
+.errorMessage {
+  font-family: 'Poppins', sans-serif;
+  font-size: 12px;
+  color: #dc3545;
+  background: #f8d7da;
+  padding: 8px;
+  border-radius: 4px;
+  text-align: center;
+  font-weight: 600;
+  animation: fadeIn 0.2s ease-out;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}

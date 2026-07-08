@@ -1,0 +1,8 @@
+boto3>=1.35.0
+python-dotenv>=1.0.0
+openai>=1.54.0
+requests>=2.31.0
+pydantic>=2.9.0
+aws-lambda-powertools>=3.0.0
+jsonschema>=4.20.0
+PyJWT[crypto]>=2.9.0

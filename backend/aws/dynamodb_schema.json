@@ -1,0 +1,39 @@
+{
+  "TableName": "SubtitleLearningData",
+  "AttributeDefinitions": [
+    { "AttributeName": "user_id",        "AttributeType": "S" },
+    { "AttributeName": "sort_key",       "AttributeType": "S" },
+    { "AttributeName": "canonical_form", "AttributeType": "S" },
+    { "AttributeName": "kind",           "AttributeType": "S" }
+  ],
+  "KeySchema": [
+    { "AttributeName": "user_id",  "KeyType": "HASH"  },
+    { "AttributeName": "sort_key", "KeyType": "RANGE" }
+  ],
+  "GlobalSecondaryIndexes": [
+    {
+      "IndexName": "canonical_form_index",
+      "KeySchema": [
+        { "AttributeName": "canonical_form", "KeyType": "HASH"  },
+        { "AttributeName": "user_id",        "KeyType": "RANGE" }
+      ],
+      "Projection": { "ProjectionType": "ALL" }
+    },
+    {
+      "IndexName": "kind_index",
+      "KeySchema": [
+        { "AttributeName": "user_id", "KeyType": "HASH"  },
+        { "AttributeName": "kind",    "KeyType": "RANGE" }
+      ],
+      "Projection": { "ProjectionType": "ALL" }
+    }
+  ],
+  "BillingMode": "PAY_PER_REQUEST",
+  "StreamSpecification": {
+    "StreamViewType": "NEW_AND_OLD_IMAGES"
+  },
+  "Tags": [
+    { "Key": "Application", "Value": "SubtitleLearningExtension" },
+    { "Key": "Environment",  "Value": "production" }
+  ]
+}

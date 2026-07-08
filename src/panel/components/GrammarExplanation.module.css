@@ -1,0 +1,142 @@
+.container {
+  background: white;
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  padding: 16px;
+  margin-top: 12px;
+  animation: expandIn 0.3s ease-out;
+}
+
+@keyframes expandIn {
+  from {
+    opacity: 0;
+    max-height: 0;
+  }
+  to {
+    opacity: 1;
+    max-height: 1000px;
+  }
+}
+
+.structure {
+  margin-bottom: 16px;
+}
+
+.structure h4,
+.phrases h4,
+.additionalInfo h4 {
+  font-family: 'Poppins', sans-serif;
+  font-weight: 700;
+  font-size: 13px;
+  color: #667eea;
+  margin-bottom: 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.structure p {
+  font-family: 'Lora', serif;
+  font-size: 14px;
+  color: #555;
+  line-height: 1.6;
+}
+
+.difficulty {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 16px;
+  padding: 10px;
+  background: #f8f8f8;
+  border-radius: 6px;
+}
+
+.label {
+  font-family: 'Poppins', sans-serif;
+  font-size: 12px;
+  font-weight: 600;
+  color: #666;
+}
+
+.badge {
+  display: inline-block;
+  padding: 4px 12px;
+  border-radius: 20px;
+  color: white;
+  font-family: 'Poppins', sans-serif;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.phrases {
+  margin-bottom: 16px;
+}
+
+.phrases ul {
+  list-style: none;
+  padding: 0;
+}
+
+.phraseItem {
+  padding: 10px;
+  margin-bottom: 10px;
+  background: #fafafa;
+  border-left: 3px solid #764ba2;
+  border-radius: 4px;
+}
+
+.phraseText {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.phraseText strong {
+  font-family: 'Poppins', sans-serif;
+  color: #333;
+  font-size: 14px;
+}
+
+.partOfSpeech {
+  font-family: 'Poppins', sans-serif;
+  font-size: 10px;
+  background: #e0e7ff;
+  color: #667eea;
+  padding: 2px 8px;
+  border-radius: 3px;
+  font-weight: 600;
+}
+
+.phraseType {
+  font-family: 'Poppins', sans-serif;
+  font-size: 10px;
+  color: #999;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 6px;
+  font-weight: 600;
+}
+
+.explanation {
+  font-family: 'Lora', serif;
+  font-size: 12px;
+  color: #666;
+  line-height: 1.5;
+  margin: 0;
+}
+
+.additionalInfo {
+  background: #f0f4ff;
+  padding: 12px;
+  border-radius: 6px;
+  border-left: 3px solid #667eea;
+}
+
+.additionalInfo p {
+  font-family: 'Lora', serif;
+  font-size: 13px;
+  color: #555;
+  line-height: 1.6;
+  margin: 0;
+}
