@@ -1,14 +1,18 @@
-import type { SubtitleChunk } from '../types/subtitle';
 import type { MeaningfulSentence } from '../types/subtitle';
 import type { MessageRequest, MessageResponse, PlaybackControlPayload } from '../types/common';
 import { groupAndProcessSubtitles } from '../utils/subtitle-processor';
+import {
+  closeObservedSubtitleAtNextStart,
+  type CapturedSubtitleChunk,
+  updateMatchingSubtitleTiming
+} from '../utils/subtitle-timing';
 
 let subtitleObserver: MutationObserver | null = null;
 let subtitleCaptureInterval: number | null = null;
 let overlayRefreshInterval: number | null = null;
 let lastCapturedSubtitleText = '';
 let lastPlaybackHref = '';
-let collectedSubtitles: SubtitleChunk[] = [];
+let collectedSubtitles: CapturedSubtitleChunk[] = [];
 let meaningfulSentences: MeaningfulSentence[] = [];
 let lastDetectedCaptionLanguageCode = '';
 
@@ -186,18 +190,38 @@ function resetSubtitleState(): void {
   renderOverlayWordPopup();
 }
 
+function getVideoElement(): HTMLVideoElement | null {
+  const videoElements = Array.from(document.querySelectorAll('video')) as HTMLVideoElement[];
+  if (videoElements.length === 0) return null;
+
+  let bestVideo: HTMLVideoElement | null = null;
+  let bestScore = Number.NEGATIVE_INFINITY;
+
+  for (const video of videoElements) {
+    const rect = video.getBoundingClientRect();
+    const visibleArea = Math.max(0, rect.width) * Math.max(0, rect.height);
+    let score = Math.min(visibleArea, 10_000_000);
+
+    if (!video.paused && !video.ended) score += 1_000_000_000;
+    if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) score += 100_000_000;
+    if (video.currentSrc) score += 10_000_000;
+    if (Number.isFinite(video.currentTime)) score += 1_000_000;
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestVideo = video;
+    }
+  }
+
+  return bestVideo;
+}
+
 function getCurrentTimeMs(): number | null {
-  const videoElement = document.querySelector('video') as HTMLVideoElement | null;
-  if (!videoElement || Number.isNaN(videoElement.currentTime)) {
+  const videoElement = getVideoElement();
+  if (!videoElement || !Number.isFinite(videoElement.currentTime)) {
     return null;
   }
   return Math.max(0, Math.round(videoElement.currentTime * 1000));
-}
-
-function getVideoElement(): HTMLVideoElement | null {
-  const videoElement = document.querySelector('video') as HTMLVideoElement | null;
-  if (!videoElement) return null;
-  return videoElement;
 }
 
 function isEditableElement(target: EventTarget | null): boolean {
@@ -236,13 +260,13 @@ function extractTextFromCue(cue: TextTrackCue): string {
   return normalizeSubtitleText(rawText);
 }
 
-function getSubtitleTextFromMediaTextTracks(): string {
-  const videoElement = document.querySelector('video') as HTMLVideoElement | null;
+function getActiveSubtitleFromMediaTextTracks(): CapturedSubtitleChunk | null {
+  const videoElement = getVideoElement();
   if (!videoElement || !videoElement.textTracks || videoElement.textTracks.length === 0) {
-    return '';
+    return null;
   }
 
-  const activeLines: string[] = [];
+  const samples: Array<{ subtitle: CapturedSubtitleChunk; showing: boolean }> = [];
   for (let i = 0; i < videoElement.textTracks.length; i += 1) {
     const track = videoElement.textTracks[i];
     if (track.kind !== 'subtitles' && track.kind !== 'captions') {
@@ -254,6 +278,10 @@ function getSubtitleTextFromMediaTextTracks(): string {
       continue;
     }
 
+    const activeLines: string[] = [];
+    let startTime = Number.POSITIVE_INFINITY;
+    let endTime = Number.NEGATIVE_INFINITY;
+
     for (let cueIndex = 0; cueIndex < activeCues.length; cueIndex += 1) {
       const cue = activeCues[cueIndex];
       if (!cue) continue;
@@ -261,10 +289,36 @@ function getSubtitleTextFromMediaTextTracks(): string {
       if (cueText) {
         activeLines.push(cueText);
       }
+      if (Number.isFinite(cue.startTime)) {
+        startTime = Math.min(startTime, Math.round(cue.startTime * 1000));
+      }
+      if (Number.isFinite(cue.endTime)) {
+        endTime = Math.max(endTime, Math.round(cue.endTime * 1000));
+      }
     }
+
+    const text = normalizeSubtitleText(activeLines.join(' '));
+    if (!text || !Number.isFinite(startTime) || !Number.isFinite(endTime)) {
+      continue;
+    }
+
+    samples.push({
+      subtitle: {
+        text,
+        startTime: Math.max(0, startTime),
+        endTime: Math.max(startTime + 1, endTime),
+        timingSource: 'media-cue'
+      },
+      showing: track.mode === 'showing'
+    });
   }
 
-  return normalizeSubtitleText(activeLines.join(' '));
+  const selected = samples.find((sample) => sample.showing) || samples[0];
+  return selected?.subtitle || null;
+}
+
+function getSubtitleTextFromMediaTextTracks(): string {
+  return getActiveSubtitleFromMediaTextTracks()?.text || '';
 }
 
 function normalizeLanguageCode(value: string): string {
@@ -300,7 +354,7 @@ function getOverlayEffectiveTargetLanguage(): string {
 }
 
 function getActiveSubtitleLanguageCodeFromTracks(): string {
-  const videoElement = document.querySelector('video') as HTMLVideoElement | null;
+  const videoElement = getVideoElement();
   if (!videoElement || !videoElement.textTracks || videoElement.textTracks.length === 0) {
     return lastDetectedCaptionLanguageCode;
   }
@@ -470,10 +524,11 @@ function getVisibleSubtitleTextFromMax(): string {
   return '';
 }
 
-function extractSubtitlesFromNetflix(): SubtitleChunk[] {
-  const subtitles: SubtitleChunk[] = [];
+function extractSubtitlesFromNetflix(): CapturedSubtitleChunk[] {
+  const subtitles: CapturedSubtitleChunk[] = [];
 
   try {
+    const mediaSubtitle = getActiveSubtitleFromMediaTextTracks();
     const text =
       activePlatform === 'max'
         ? getVisibleSubtitleTextFromMax()
@@ -483,9 +538,19 @@ function extractSubtitlesFromNetflix(): SubtitleChunk[] {
     const currentTimeMs = getCurrentTimeMs();
     if (currentTimeMs === null) return subtitles;
 
-    const startTime = currentTimeMs;
-    const endTime = startTime + 1200;
-    subtitles.push({ text, startTime, endTime });
+    if (mediaSubtitle && mediaSubtitle.text === text) {
+      subtitles.push(mediaSubtitle);
+    } else {
+      // DOM captions do not expose cue boundaries. Record when the caption is actually
+      // observed and let the next observation/caption close it; future padding makes
+      // every following caption start late.
+      subtitles.push({
+        text,
+        startTime: currentTimeMs,
+        endTime: currentTimeMs,
+        timingSource: 'observed'
+      });
+    }
   } catch (error) {
     console.error('Error extracting subtitles:', error);
   }
@@ -2147,7 +2212,7 @@ function collectAndProcessSubtitles(): void {
   const latest = liveSubtitles[0];
   const previous = collectedSubtitles[collectedSubtitles.length - 1];
   if (previous && latest.text === previous.text) {
-    previous.endTime = Math.max(previous.endTime, latest.endTime);
+    updateMatchingSubtitleTiming(previous, latest);
     renderOnVideoSentenceOverlay();
     return;
   }
@@ -2158,11 +2223,7 @@ function collectAndProcessSubtitles(): void {
   }
 
   if (previous) {
-    latest.startTime = Math.max(latest.startTime, previous.endTime + 1);
-  }
-
-  if (previous && previous.endTime < latest.startTime) {
-    previous.endTime = latest.startTime;
+    closeObservedSubtitleAtNextStart(previous, latest.startTime);
   }
 
   collectedSubtitles.push(latest);
@@ -2232,7 +2293,7 @@ if (document.readyState === 'loading') {
 
 chrome.runtime.onMessage.addListener((message: MessageRequest, sender, sendResponse) => {
   if (message.type === 'GET_CURRENT_VIDEO') {
-    const videoElement = document.querySelector('video') as HTMLVideoElement;
+    const videoElement = getVideoElement();
     const currentSessionId = getSessionId();
     sendResponse({
       success: true,

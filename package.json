@@ -6,7 +6,8 @@
     "build": "webpack --mode production",
     "dev": "webpack --mode development --watch",
     "start": "webpack serve --mode development",
-    "type-check": "tsc --noEmit"
+    "type-check": "tsc --noEmit",
+    "test:subtitle-timing": "tsc tests/subtitle-timing.test.ts src/utils/subtitle-timing.ts --module commonjs --moduleResolution node --target ES2020 --outDir /tmp/language-extension-subtitle-timing-tests --esModuleInterop --skipLibCheck && node --test /tmp/language-extension-subtitle-timing-tests/tests/subtitle-timing.test.js"
   },
   "dependencies": {
     "react": "^18.2.0",

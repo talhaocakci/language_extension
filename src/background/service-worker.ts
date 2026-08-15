@@ -11,7 +11,7 @@ const EXPLAIN_URL = `${API_BASE_URL}/explain`;
 const EXPLAIN_PROMPT_ID = 'language_backend:tier3:explain_sentence';
 // language_backend tier1 public endpoint (non-API-Gateway)
 const LANGUAGE_TIER1_BASE_URL = 'https://api.getfluentfast.app';
-const COGNITO_DOMAIN    = 'https://langext-prod.auth.eu-central-1.amazoncognito.com';
+const COGNITO_DOMAIN    = 'https://auth.getfluentfast.app';
 const COGNITO_CLIENT_ID = '73qd5gena9hggpc4ms7b2ip7ea'; // language_backend web SPA client
 
 // ── PKCE helpers ─────────────────────────────────────────────────────────────

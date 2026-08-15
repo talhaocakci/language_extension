@@ -22,6 +22,24 @@ variable "cognito_hosted_ui_subdomain" {
   default     = "langext-prod"
 }
 
+variable "cognito_hosted_ui_branding_client_id" {
+  description = "Shared web/extension Cognito app client that receives the GetFluentFast Hosted UI branding"
+  type        = string
+  default     = "73qd5gena9hggpc4ms7b2ip7ea"
+}
+
+variable "cognito_custom_domain" {
+  description = "Branded hostname for Cognito sign-in and OAuth endpoints"
+  type        = string
+  default     = "auth.getfluentfast.app"
+}
+
+variable "cognito_custom_domain_zone" {
+  description = "Public Route 53 zone that contains the branded Cognito hostname"
+  type        = string
+  default     = "getfluentfast.app"
+}
+
 variable "chrome_extension_id" {
   description = "Chrome extension ID shown in chrome://extensions (used as Cognito callback URL)"
   type        = string

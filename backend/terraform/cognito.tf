@@ -44,6 +44,84 @@ resource "aws_cognito_user_pool_domain" "main" {
   user_pool_id = aws_cognito_user_pool.main.id
 }
 
+data "aws_route53_zone" "cognito_custom_domain" {
+  name         = "${var.cognito_custom_domain_zone}."
+  private_zone = false
+}
+
+resource "aws_acm_certificate" "cognito_custom_domain" {
+  provider = aws.us_east_1
+
+  domain_name       = var.cognito_custom_domain
+  validation_method = "DNS"
+
+  options {
+    certificate_transparency_logging_preference = "ENABLED"
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_route53_record" "cognito_custom_domain_validation" {
+  for_each = {
+    for option in aws_acm_certificate.cognito_custom_domain.domain_validation_options :
+    option.domain_name => {
+      name   = option.resource_record_name
+      record = option.resource_record_value
+      type   = option.resource_record_type
+    }
+  }
+
+  allow_overwrite = true
+  name            = each.value.name
+  records         = [each.value.record]
+  ttl             = 300
+  type            = each.value.type
+  zone_id         = data.aws_route53_zone.cognito_custom_domain.zone_id
+}
+
+resource "aws_acm_certificate_validation" "cognito_custom_domain" {
+  provider = aws.us_east_1
+
+  certificate_arn         = aws_acm_certificate.cognito_custom_domain.arn
+  validation_record_fqdns = values(aws_route53_record.cognito_custom_domain_validation)[*].fqdn
+}
+
+resource "aws_cognito_user_pool_domain" "custom" {
+  domain                = var.cognito_custom_domain
+  certificate_arn       = aws_acm_certificate_validation.cognito_custom_domain.certificate_arn
+  managed_login_version = 1
+  user_pool_id          = aws_cognito_user_pool.main.id
+}
+
+resource "aws_route53_record" "cognito_custom_domain" {
+  allow_overwrite = true
+  name            = aws_cognito_user_pool_domain.custom.domain
+  type            = "A"
+  zone_id         = data.aws_route53_zone.cognito_custom_domain.zone_id
+
+  alias {
+    evaluate_target_health = false
+    name                   = aws_cognito_user_pool_domain.custom.cloudfront_distribution
+    zone_id                = aws_cognito_user_pool_domain.custom.cloudfront_distribution_zone_id
+  }
+}
+
+# Keep the classic Hosted UI visually aligned with the GetFluentFast iOS app.
+# The extension currently authenticates with the shared web/extension client,
+# so branding is deliberately scoped to that client instead of every pool app.
+resource "aws_cognito_user_pool_ui_customization" "shared_web_extension" {
+  client_id = var.cognito_hosted_ui_branding_client_id
+
+  css        = file("${path.module}/assets/cognito-hosted-ui.css")
+  image_file = filebase64("${path.module}/assets/cognito-logo.png")
+
+  # Referencing the domain ensures Cognito is ready to accept customization.
+  user_pool_id = aws_cognito_user_pool_domain.main.user_pool_id
+}
+
 # ── App client for Chrome Extension (PKCE / OAuth2 code flow) ────────────────
 resource "aws_cognito_user_pool_client" "extension" {
   name         = "${local.name}-extension-client"

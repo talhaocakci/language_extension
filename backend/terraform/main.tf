@@ -23,6 +23,16 @@ provider "aws" {
   }
 }
 
+# Cognito custom-domain certificates must be issued in us-east-1 because the
+# hosted sign-in pages are served through CloudFront.
+provider "aws" {
+  alias  = "us_east_1"
+  region = "us-east-1"
+  default_tags {
+    tags = local.common_tags
+  }
+}
+
 locals {
   prefix = "langext"
   env    = var.environment
@@ -38,7 +48,7 @@ locals {
   # Absolute path to repository root (two levels above backend/terraform/)
   repo_root = abspath("${path.module}/../..")
 
-  lambda_src  = "${local.repo_root}/backend/lambda"
-  vocab_src   = "${local.repo_root}/vocabulary-app"
-  build_dir   = "${path.module}/build"
+  lambda_src = "${local.repo_root}/backend/lambda"
+  vocab_src  = "${local.repo_root}/vocabulary-app"
+  build_dir  = "${path.module}/build"
 }

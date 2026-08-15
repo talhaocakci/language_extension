@@ -79,7 +79,7 @@ const PopupApp: React.FC = () => {
   return (
     <div className="popupApp">
       <header className="popupHeader">
-        <h1>📚 Subtitle Learning</h1>
+        <h1>GetFluentFast</h1>
         <p className="subtitle">Learn languages from video subtitles</p>
       </header>
 
@@ -140,7 +140,7 @@ const PopupApp: React.FC = () => {
                     onClick={handleSignIn}
                     disabled={authBusy}
                   >
-                    {authBusy ? 'Opening login…' : 'Sign in with Cognito'}
+                    {authBusy ? 'Opening sign-in…' : 'Sign in'}
                   </button>
                   {authError && <p className="authError">{authError}</p>}
                 </div>
