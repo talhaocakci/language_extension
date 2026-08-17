@@ -14,13 +14,14 @@ import {
   normalizeLanguagePreference,
 } from '../utils/language-preferences';
 import {
+  cleanupStaleNetflixSentenceAudioClips,
+  deleteNetflixSentenceAudioClip,
   findNetflixSentenceAudioClip,
+  getNetflixSentenceAudioClipData,
   getNetflixSentenceAudioStatus,
-  playNetflixSentenceAudioClip,
   recordNetflixSentenceAudioClip,
 } from '../experiments/netflix-audio/content-client';
 import {
-  NETFLIX_AUDIO_EXPERIMENT_ENABLED,
   NETFLIX_AUDIO_MESSAGES,
   type NetflixAudioClipMetadata,
 } from '../experiments/netflix-audio/protocol';
@@ -141,12 +142,10 @@ let overlayExplanationLanguage = DEFAULT_EXPLANATION_LANGUAGE;
 let overlayWordPopup: WordPopupState | null = null;
 let overlayWordLookupReqId = 0;
 
-type OverlayAudioExperimentState = 'checking' | 'unavailable' | 'ready' | 'recording' | 'saved' | 'playing' | 'error';
-let overlayAudioExperimentState: OverlayAudioExperimentState = 'checking';
-let overlayAudioExperimentSentenceKey = '';
-let overlayAudioExperimentClip: NetflixAudioClipMetadata | null = null;
-let overlayAudioExperimentError = '';
-let overlayAudioExperimentRequestId = 0;
+type OverlaySentenceSaveState = 'idle' | 'preflight' | 'capture-required' | 'capturing' | 'saving' | 'saved' | 'error';
+let overlaySentenceSaveState: OverlaySentenceSaveState = 'idle';
+let overlaySentenceSaveMessage = '';
+let overlaySentenceSavedItemId = '';
 
 const wordMeaningCache: Record<string, WordMeaning> = {};
 const sentenceAnalysisCache: Record<string, SentenceAnalysis> = {};
@@ -201,11 +200,9 @@ function resetSubtitleState(): void {
 
   overlayWordPopup = null;
   overlayWordLookupReqId += 1;
-  overlayAudioExperimentState = 'checking';
-  overlayAudioExperimentSentenceKey = '';
-  overlayAudioExperimentClip = null;
-  overlayAudioExperimentError = '';
-  overlayAudioExperimentRequestId += 1;
+  overlaySentenceSaveState = 'idle';
+  overlaySentenceSaveMessage = '';
+  overlaySentenceSavedItemId = '';
   for (const key of Object.keys(overlaySaveState)) delete overlaySaveState[key];
   for (const key of Object.keys(overlaySaveError)) delete overlaySaveError[key];
 
@@ -1034,8 +1031,9 @@ function buildSourceUrl(startTimeMs: number): string {
   const seconds = Math.floor(startTimeMs / 1000);
   try {
     const url = new URL(base);
-    url.searchParams.set('t', String(seconds));
-    return url.toString();
+    const clean = new URL(`${url.protocol}//${url.host}${url.pathname}`);
+    clean.searchParams.set('t', String(seconds));
+    return clean.toString();
   } catch {
     return base;
   }
@@ -1380,136 +1378,134 @@ function syncStreamingOverlayWithPlayer(overlay: HTMLDivElement): void {
   suppressStreamingNativeCaptions();
 }
 
-// NETFLIX_AUDIO_EXPERIMENT: this entire block is an isolated player-UI adapter.
-function updateOverlayAudioExperimentButton(): void {
-  const button = document.querySelector('.sl-overlay-audio-experiment-btn') as HTMLButtonElement | null;
-  if (!button) return;
+interface SentencePreflightData {
+  original_audio_storage_enabled?: boolean;
+  max_audio_bytes?: number;
+  code?: string;
+}
 
-  const labels: Record<OverlayAudioExperimentState, string> = {
-    checking: 'Audio…',
-    unavailable: '⚗ Audio',
-    ready: '🎙 Audio',
-    recording: '⏺ Audio',
-    saved: '▶ Clip',
-    playing: '🔊 Clip',
-    error: '! Audio',
+function sentenceSource(sentence: MeaningfulSentence): Record<string, unknown> {
+  return {
+    platform: activePlatform,
+    url: buildSourceUrl(sentence.startTime),
+    title: document.title,
+    content_id: getSessionId(),
+    start_ms: Math.max(0, Math.round(sentence.startTime)),
+    end_ms: Math.max(Math.round(sentence.startTime) + 1, Math.round(sentence.endTime)),
   };
-  button.textContent = labels[overlayAudioExperimentState];
-  button.disabled = overlayAudioExperimentState === 'checking' ||
-    overlayAudioExperimentState === 'recording' ||
-    overlayAudioExperimentState === 'playing';
-  button.title = overlayAudioExperimentError || (
-    overlayAudioExperimentState === 'unavailable'
-      ? 'Open the extension popup and enable the Netflix audio experiment for this tab.'
-      : overlayAudioExperimentState === 'saved'
-        ? 'Play the locally saved sentence audio clip.'
-        : 'Record this subtitle from the Netflix tab audio.'
-  );
-  button.setAttribute('aria-label', button.title);
-  button.style.opacity = button.disabled ? '0.68' : '1';
 }
 
-async function refreshOverlayAudioExperiment(sentence: MeaningfulSentence): Promise<void> {
-  if (!NETFLIX_AUDIO_EXPERIMENT_ENABLED) return;
-  const sentenceKey = getSentenceStableKey(sentence);
-  overlayAudioExperimentSentenceKey = sentenceKey;
-  overlayAudioExperimentState = 'checking';
-  overlayAudioExperimentClip = null;
-  overlayAudioExperimentError = '';
-  const requestId = ++overlayAudioExperimentRequestId;
-  updateOverlayAudioExperimentButton();
-
-  try {
-    const status = await getNetflixSentenceAudioStatus();
-    const clip = status.offscreenReady
-      ? await findNetflixSentenceAudioClip(sentenceKey)
-      : null;
-    if (requestId !== overlayAudioExperimentRequestId ||
-        sentenceKey !== overlayAudioExperimentSentenceKey) return;
-
-    overlayAudioExperimentClip = clip;
-    overlayAudioExperimentState = clip
-      ? 'saved'
-      : status.recording
-        ? 'recording'
-        : status.activeForCurrentTab
-          ? 'ready'
-          : 'unavailable';
-  } catch (error) {
-    if (requestId !== overlayAudioExperimentRequestId) return;
-    overlayAudioExperimentState = 'error';
-    overlayAudioExperimentError = error instanceof Error ? error.message : String(error);
-  }
-  updateOverlayAudioExperimentButton();
-}
-
-async function handleOverlayAudioExperimentClick(): Promise<void> {
+async function saveExplainedSentence(): Promise<void> {
   const sentence = overlayCurrentSentence;
-  if (!sentence || !NETFLIX_AUDIO_EXPERIMENT_ENABLED) return;
+  if (!sentence) return;
   const sentenceKey = getSentenceStableKey(sentence);
+  const analysis = sentenceAnalysisCache[sentenceKey];
+  if (!analysis) return;
 
-  if (overlayAudioExperimentState === 'saved' && overlayAudioExperimentClip) {
-    overlayAudioExperimentState = 'playing';
-    overlayAudioExperimentError = '';
-    updateOverlayAudioExperimentButton();
-    try {
-      await playNetflixSentenceAudioClip(overlayAudioExperimentClip.clipId);
-      overlayAudioExperimentState = 'saved';
-    } catch (error) {
-      overlayAudioExperimentState = 'error';
-      overlayAudioExperimentError = error instanceof Error ? error.message : String(error);
-    }
-    updateOverlayAudioExperimentButton();
-    return;
-  }
+  const targetLanguage = getOverlayEffectiveTargetLanguage();
+  const basePayload = {
+    text: sentence.text,
+    target_language: targetLanguage,
+    source: sentenceSource(sentence),
+  };
+  let retryClip: NetflixAudioClipMetadata | null = null;
 
-  if (overlayAudioExperimentState === 'unavailable') {
-    overlayAudioExperimentError = 'Enable the experiment for this tab in the extension popup.';
-    updateOverlayAudioExperimentButton();
-    await chrome.runtime.sendMessage({ type: 'OPEN_EXTENSION_POPUP' }).catch(() => undefined);
-    return;
-  }
-
-  if (overlayAudioExperimentState === 'error') {
-    await refreshOverlayAudioExperiment(sentence);
-    return;
-  }
-
-  if (overlayAudioExperimentState !== 'ready') return;
-  const video = getVideoElement();
-  if (!video) {
-    overlayAudioExperimentState = 'error';
-    overlayAudioExperimentError = 'Netflix video element was not found.';
-    updateOverlayAudioExperimentButton();
-    return;
-  }
-
-  overlayAudioExperimentState = 'recording';
-  overlayAudioExperimentError = '';
-  updateOverlayAudioExperimentButton();
   try {
-    const clip = await recordNetflixSentenceAudioClip(video, {
-      sentenceKey,
-      sentenceText: sentence.text,
-      sourceUrl: buildSourceUrl(sentence.startTime),
-      videoTitle: document.title,
-      startTimeMs: sentence.startTime,
-      endTimeMs: sentence.endTime,
-    });
-    if (overlayAudioExperimentSentenceKey === sentenceKey) {
-      overlayAudioExperimentClip = clip;
-      overlayAudioExperimentState = 'saved';
+    overlaySentenceSaveState = 'preflight';
+    overlaySentenceSaveMessage = 'Checking your Learn List…';
+    renderExplainPanel();
+    const preflight = await chrome.runtime.sendMessage({
+      type: 'PREFLIGHT_SENTENCE',
+      payload: basePayload,
+    }) as MessageResponse<SentencePreflightData>;
+    if (!preflight?.success) {
+      if (preflight?.data?.code === 'SENTENCE_ALREADY_SAVED') {
+        const staleRetry = await findNetflixSentenceAudioClip(sentenceKey).catch(() => null);
+        if (staleRetry) await deleteNetflixSentenceAudioClip(staleRetry.clipId).catch(() => undefined);
+        overlaySentenceSaveState = 'saved';
+        overlaySentenceSaveMessage = 'Already saved in Sentences.';
+        renderExplainPanel();
+        return;
+      }
+      throw new Error(preflight?.error || 'Sentence preflight failed.');
     }
+
+    const originalEnabled = preflight.data?.original_audio_storage_enabled !== false;
+    if (originalEnabled) {
+      const captureStatus = await getNetflixSentenceAudioStatus();
+      if (!captureStatus.activeForCurrentTab) {
+        overlaySentenceSaveState = 'capture-required';
+        overlaySentenceSaveMessage = 'Enable tab audio capture, then press Save sentence again.';
+        renderExplainPanel();
+        await chrome.runtime.sendMessage({ type: 'OPEN_SENTENCE_AUDIO_SETUP' }).catch(() => undefined);
+        return;
+      }
+      retryClip = await findNetflixSentenceAudioClip(sentenceKey);
+      if (!retryClip) {
+        const video = getVideoElement();
+        if (!video) throw new Error('The streaming video element was not found.');
+        overlaySentenceSaveState = 'capturing';
+        overlaySentenceSaveMessage = 'Replaying this subtitle at 1× and capturing its audio…';
+        renderExplainPanel();
+        retryClip = await recordNetflixSentenceAudioClip(video, {
+          sentenceKey,
+          sentenceText: sentence.text,
+          sourceUrl: buildSourceUrl(sentence.startTime),
+          videoTitle: document.title,
+          startTimeMs: sentence.startTime,
+          endTimeMs: sentence.endTime,
+        });
+      }
+    }
+
+    overlaySentenceSaveState = 'saving';
+    overlaySentenceSaveMessage = 'Saving sentence, explanation and audio…';
+    renderExplainPanel();
+    const clipData = retryClip ? await getNetflixSentenceAudioClipData(retryClip.clipId) : null;
+    const maxBytes = Number(preflight.data?.max_audio_bytes || 4 * 1024 * 1024);
+    if (clipData && clipData.byteLength > maxBytes) {
+      throw new Error('Captured audio exceeds the 4 MiB upload limit.');
+    }
+    const saveResponse = await chrome.runtime.sendMessage({
+      type: 'SAVE_SENTENCE',
+      payload: {
+        ...basePayload,
+        folder: 'fromweb',
+        explanation_language: overlayExplanationLanguage,
+        sentence_explanation: analysis,
+        client_request_id: crypto.randomUUID(),
+        captured_audio: clipData ? {
+          base64: clipData.base64Data,
+          mime_type: clipData.mimeType,
+          duration_ms: clipData.durationMs,
+        } : null,
+      },
+    }) as MessageResponse<Record<string, unknown>>;
+    if (!saveResponse?.success) {
+      if (saveResponse?.data?.code === 'SENTENCE_ALREADY_SAVED') {
+        overlaySentenceSaveState = 'saved';
+        overlaySentenceSaveMessage = 'Already saved in Sentences.';
+        renderExplainPanel();
+        return;
+      }
+      throw new Error(saveResponse?.error || 'Could not save this sentence.');
+    }
+    if (retryClip) await deleteNetflixSentenceAudioClip(retryClip.clipId).catch(() => undefined);
+    overlaySentenceSavedItemId = String(saveResponse.data?.item_id || '');
+    const warnings = Array.isArray(saveResponse.data?.warnings)
+      ? (saveResponse.data?.warnings as unknown[]).map(String)
+      : [];
+    overlaySentenceSaveState = 'saved';
+    overlaySentenceSaveMessage = warnings.length > 0
+      ? 'Saved. One audio version could not be created; playback fallback will be used.'
+      : 'Saved to From Web → Sentences.';
   } catch (error) {
-    if (overlayAudioExperimentSentenceKey === sentenceKey) {
-      overlayAudioExperimentState = 'error';
-      overlayAudioExperimentError = error instanceof Error ? error.message : String(error);
-    }
+    const message = error instanceof Error ? error.message : String(error);
+    if (isAuthRequiredError(message)) void openExtensionPopupFromOverlay();
+    overlaySentenceSaveState = 'error';
+    overlaySentenceSaveMessage = message;
   }
-  if (overlayAudioExperimentSentenceKey !== sentenceKey && overlayCurrentSentence) {
-    void refreshOverlayAudioExperiment(overlayCurrentSentence);
-  }
-  updateOverlayAudioExperimentButton();
+  renderExplainPanel();
 }
 
 function ensureOnVideoSentenceOverlay(): HTMLDivElement {
@@ -1699,8 +1695,6 @@ function ensureOnVideoSentenceOverlay(): HTMLDivElement {
     );
     renderOverlayTargetLanguageControl();
   }).catch(() => undefined);
-
-  updateOverlayAudioExperimentButton();
 
   return overlay;
 }
@@ -2444,15 +2438,54 @@ function renderExplainPanel(): void {
     note.textContent = analysis.note || 'No learner-worthy phrases or grammar constructions detected.';
     note.style.color = '#d6e2ff';
     panel.appendChild(note);
-    return;
-  }
-
-  if (analysis.note) {
+  } else if (analysis.note) {
     const note = document.createElement('div');
     note.textContent = analysis.note;
     note.style.cssText = 'margin-top:6px;color:#b8c9f5;';
     panel.appendChild(note);
   }
+
+  const sentenceSaveWrap = document.createElement('div');
+  sentenceSaveWrap.style.cssText = 'display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:10px;padding-top:8px;border-top:1px solid rgba(175,197,255,0.22);';
+  const sentenceSaveButton = document.createElement('button');
+  sentenceSaveButton.type = 'button';
+  const busy = overlaySentenceSaveState === 'preflight' ||
+    overlaySentenceSaveState === 'capturing' || overlaySentenceSaveState === 'saving';
+  sentenceSaveButton.disabled = busy || overlaySentenceSaveState === 'saved';
+  sentenceSaveButton.textContent = overlaySentenceSaveState === 'saved'
+    ? '✓ Sentence saved'
+    : overlaySentenceSaveState === 'capture-required'
+      ? 'Enable audio capture'
+      : busy
+        ? 'Saving sentence…'
+        : overlaySentenceSaveState === 'error'
+          ? 'Retry Save sentence'
+          : '＋ Save sentence';
+  sentenceSaveButton.title = 'Save this complete sentence and its explanation to From Web → Sentences';
+  sentenceSaveButton.style.cssText = `
+    border:1px solid ${overlaySentenceSaveState === 'saved' ? 'rgba(120,220,170,0.75)' : 'rgba(153,179,255,0.72)'};
+    background:${overlaySentenceSaveState === 'saved' ? 'rgba(64,152,109,0.36)' : 'rgba(90,125,245,0.32)'};
+    color:#f2f6ff;border-radius:8px;padding:6px 11px;font-size:12px;font-weight:700;
+    cursor:${sentenceSaveButton.disabled ? 'default' : 'pointer'};opacity:${sentenceSaveButton.disabled ? '0.76' : '1'};
+  `;
+  sentenceSaveButton.addEventListener('click', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (overlaySentenceSaveState === 'capture-required') {
+      void chrome.runtime.sendMessage({ type: 'OPEN_SENTENCE_AUDIO_SETUP' });
+      return;
+    }
+    void saveExplainedSentence();
+  });
+  sentenceSaveWrap.appendChild(sentenceSaveButton);
+  if (overlaySentenceSaveMessage) {
+    const status = document.createElement('span');
+    status.textContent = overlaySentenceSaveMessage;
+    status.style.cssText = `font-size:11px;color:${overlaySentenceSaveState === 'error' ? '#ffb6b6' : '#c8d7ff'};`;
+    status.title = overlaySentenceSavedItemId ? `Learn item ${overlaySentenceSavedItemId}` : '';
+    sentenceSaveWrap.appendChild(status);
+  }
+  panel.appendChild(sentenceSaveWrap);
 }
 
 async function toggleExplainForCurrentSentence(forceRefresh = false): Promise<void> {
@@ -2722,8 +2755,10 @@ function renderOnVideoSentenceOverlay(): void {
     overlayExplainAuthActionLoading = false;
     overlayExplainAuthActionError = null;
     overlayAnalysisSentenceKey = sentenceKey;
+    overlaySentenceSaveState = 'idle';
+    overlaySentenceSaveMessage = '';
+    overlaySentenceSavedItemId = '';
     hideOverlayWordPopup();
-    void refreshOverlayAudioExperiment(sentence);
   }
 
   const shouldRerender =
@@ -2754,7 +2789,6 @@ function renderOnVideoSentenceOverlay(): void {
   renderOverlayTargetLanguageControl();
   renderExplainPanel();
   setExplainButtonState();
-  updateOverlayAudioExperimentButton();
 
   overlay.style.opacity = '1';
   overlayHidden = false;
@@ -2872,6 +2906,7 @@ function initializeNetflixExtension(): void {
   console.log(`Initializing Subtitle Learning Extension for ${activePlatform}`);
 
   bindOverlayGlobalListeners();
+  void cleanupStaleNetflixSentenceAudioClips().catch(() => undefined);
   lastPlaybackSessionId = getSessionId();
   ensureStreamingToggleButton();
   window.addEventListener('resize', ensureStreamingToggleButton, { passive: true });
@@ -2897,7 +2932,11 @@ if (document.readyState === 'loading') {
 
 chrome.runtime.onMessage.addListener((message: MessageRequest, sender, sendResponse) => {
   if (message.type === NETFLIX_AUDIO_MESSAGES.STATUS_CHANGED) {
-    if (overlayCurrentSentence) void refreshOverlayAudioExperiment(overlayCurrentSentence);
+    if (overlaySentenceSaveState === 'capture-required') {
+      overlaySentenceSaveState = 'idle';
+      overlaySentenceSaveMessage = 'Audio capture is ready. Press Save sentence.';
+      renderExplainPanel();
+    }
     sendResponse({ success: true } as MessageResponse);
   } else if (message.type === 'GET_CURRENT_VIDEO') {
     const videoElement = getVideoElement();

@@ -226,6 +226,33 @@ function normalizeLearnItemError(status: number, raw: string): { message: string
   };
 }
 
+async function authenticatedTier1Json(
+  path: string,
+  method: 'GET' | 'POST',
+  body?: Record<string, unknown>,
+): Promise<{ response: Response; text: string }> {
+  let token = await getValidIdToken();
+  if (!token) throw new Error('Not logged in. Please sign in from the extension popup.');
+  const execute = (bearer: string) => fetch(`${LANGUAGE_TIER1_BASE_URL}${path}`, {
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${bearer}`,
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  let response = await execute(token);
+  if (response.status === 401) {
+    const stored = await getStoredTokens();
+    const refreshed = stored?.refreshToken ? await refreshIdToken(stored.refreshToken) : null;
+    if (refreshed) {
+      token = refreshed;
+      response = await execute(token);
+    }
+  }
+  return { response, text: await response.text() };
+}
+
 chrome.tabs.onRemoved.addListener((tabId) => {
   capturedTimedtextUrls.delete(tabId);
   void stopNetflixAudioExperimentForTab(tabId);
@@ -698,6 +725,64 @@ If nothing learner-worthy is found, return empty arrays. Do not invent translati
           sendResponse({ success: true, data: { opened: 'settings' } });
         } catch (err) {
           sendResponse({ success: false, error: `Failed to open extension settings: ${String(err)}` });
+        }
+      })();
+      return true;
+    }
+
+    if (message.type === 'OPEN_SENTENCE_AUDIO_SETUP') {
+      (async () => {
+        try {
+          if (sender.tab?.id !== undefined) {
+            await chrome.storage.session.set({ sentence_audio_setup_tab_id: sender.tab.id });
+          }
+          if (chrome.action && typeof chrome.action.openPopup === 'function') {
+            try {
+              await chrome.action.openPopup();
+              sendResponse({ success: true, data: { opened: 'popup' } });
+              return;
+            } catch (error) {
+              console.warn('Could not open sentence setup popup; using a tab instead.', error);
+            }
+          }
+          const setupUrl = chrome.runtime.getURL('popup/index.html?tab=profile&focus=sentence-audio');
+          await chrome.tabs.create({ url: setupUrl, active: true });
+          sendResponse({ success: true, data: { opened: 'sentence-audio' } });
+        } catch (err) {
+          sendResponse({ success: false, error: `Failed to open sentence audio setup: ${String(err)}` });
+        }
+      })();
+      return true;
+    }
+
+    if (message.type === 'PREFLIGHT_SENTENCE' || message.type === 'SAVE_SENTENCE') {
+      (async () => {
+        try {
+          const isSave = message.type === 'SAVE_SENTENCE';
+          const { response, text } = await authenticatedTier1Json(
+            isSave ? '/learn-items/sentences' : '/learn-items/sentences/preflight',
+            'POST',
+            (message.payload || {}) as Record<string, unknown>,
+          );
+          let data: Record<string, unknown> = {};
+          try {
+            data = JSON.parse(text) as Record<string, unknown>;
+          } catch {
+            data = { error: text };
+          }
+          if (!response.ok) {
+            const duplicate = response.status === 409 && data.error === 'sentence_already_saved';
+            const normalized = normalizeLearnItemError(response.status, text);
+            sendResponse({
+              success: false,
+              error: duplicate ? 'This sentence is already in your Learn List.' : normalized.message,
+              data: { ...data, code: duplicate ? 'SENTENCE_ALREADY_SAVED' : normalized.code },
+            });
+            return;
+          }
+          sendResponse({ success: true, data });
+        } catch (err) {
+          sendResponse({ success: false, error: err instanceof Error ? err.message : String(err) });
         }
       })();
       return true;

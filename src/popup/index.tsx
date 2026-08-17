@@ -6,7 +6,6 @@ import {
   normalizeLanguagePreference,
 } from '../utils/language-preferences';
 import {
-  clearNetflixAudioExperimentClips,
   getNetflixAudioExperimentStatus,
   startNetflixAudioExperiment,
   stopNetflixAudioExperiment,
@@ -36,6 +35,14 @@ const PopupApp: React.FC = () => {
   const [audioExperimentMessage, setAudioExperimentMessage] = useState('');
 
   useEffect(() => { void loadAll(); }, []);
+  useEffect(() => {
+    void (async () => {
+      const queryFocus = new URLSearchParams(window.location.search).get('focus') === 'sentence-audio';
+      const stored = await chrome.storage.session.get('sentence_audio_setup_tab_id');
+      if (!queryFocus && !stored.sentence_audio_setup_tab_id) return;
+      window.setTimeout(() => document.getElementById('sentence-audio-capture')?.scrollIntoView({ block: 'center' }), 120);
+    })();
+  }, []);
 
   const loadAll = async () => {
     try {
@@ -62,7 +69,7 @@ const PopupApp: React.FC = () => {
     try {
       const status = await startNetflixAudioExperiment();
       setAudioExperimentStatus(status);
-      setAudioExperimentMessage('Ready. Use “Save audio” on a Netflix subtitle.');
+      setAudioExperimentMessage('Ready. Return to the video and press Save sentence again.');
     } catch (err) {
       setAudioExperimentMessage(err instanceof Error ? err.message : String(err));
     } finally {
@@ -75,20 +82,7 @@ const PopupApp: React.FC = () => {
     setAudioExperimentMessage('Stopping…');
     try {
       setAudioExperimentStatus(await stopNetflixAudioExperiment());
-      setAudioExperimentMessage('Audio capture stopped. Local clips are still available.');
-    } catch (err) {
-      setAudioExperimentMessage(err instanceof Error ? err.message : String(err));
-    } finally {
-      setAudioExperimentBusy(false);
-    }
-  };
-
-  const handleClearAudioExperimentClips = async () => {
-    setAudioExperimentBusy(true);
-    setAudioExperimentMessage('Deleting local clips…');
-    try {
-      await clearNetflixAudioExperimentClips();
-      setAudioExperimentMessage('All experimental audio clips were deleted.');
+      setAudioExperimentMessage('Audio capture stopped. Unsent retry data expires within 24 hours.');
     } catch (err) {
       setAudioExperimentMessage(err instanceof Error ? err.message : String(err));
     } finally {
@@ -258,14 +252,15 @@ const PopupApp: React.FC = () => {
             </div>
 
             {NETFLIX_AUDIO_EXPERIMENT_ENABLED && (
-              <div className="audioExperimentCard">
+              <div className="audioExperimentCard" id="sentence-audio-capture">
                 <div className="audioExperimentHeading">
-                  <strong>Netflix audio clips</strong>
-                  <span>Experiment</span>
+                  <strong>Sentence audio capture</strong>
+                  <span>Netflix / Max</span>
                 </div>
                 <p>
-                  Records the current subtitle from the active Netflix or Max tab.
-                  Clips stay only in this browser.
+                  When you press Save sentence, the extension replays that subtitle and records
+                  the tab audio. The clip is uploaded to your private Learn List storage. Temporary
+                  browser data is deleted after upload and expires after 24 hours if a retry is needed.
                 </p>
                 <div className={`audioExperimentStatus ${audioExperimentStatus?.active ? 'active' : ''}`}>
                   {audioExperimentStatus?.active
@@ -291,13 +286,6 @@ const PopupApp: React.FC = () => {
                       {audioExperimentBusy ? 'Starting…' : 'Enable for active tab'}
                     </button>
                   )}
-                  <button
-                    type="button"
-                    onClick={() => { void handleClearAudioExperimentClips(); }}
-                    disabled={audioExperimentBusy}
-                  >
-                    Delete local clips
-                  </button>
                 </div>
                 {audioExperimentMessage && (
                   <small className="audioExperimentMessage">{audioExperimentMessage}</small>

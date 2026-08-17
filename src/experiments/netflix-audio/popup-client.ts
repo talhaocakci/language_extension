@@ -7,7 +7,14 @@ import {
 
 async function getActivePlayerTab(): Promise<chrome.tabs.Tab> {
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-  const tab = tabs[0];
+  let tab: chrome.tabs.Tab | undefined = tabs[0];
+  if (!tab?.id || !isNetflixOrMaxUrl(tab.url || '')) {
+    const stored = await chrome.storage.session.get('sentence_audio_setup_tab_id');
+    const storedId = Number(stored.sentence_audio_setup_tab_id);
+    if (Number.isInteger(storedId)) {
+      tab = await chrome.tabs.get(storedId).catch(() => undefined);
+    }
+  }
   if (!tab?.id || !isNetflixOrMaxUrl(tab.url || '')) {
     throw new Error('Open a Netflix or Max player tab first.');
   }
@@ -21,7 +28,11 @@ export async function getNetflixAudioExperimentStatus(): Promise<NetflixAudioCap
   if (!response?.success || !response.data) {
     throw new Error(response?.error || 'Could not read audio experiment status.');
   }
-  return response.data;
+  const playerTab = await getActivePlayerTab().catch(() => null);
+  return {
+    ...response.data,
+    activeForCurrentTab: response.data.active && response.data.capturedTabId === playerTab?.id,
+  };
 }
 
 export async function startNetflixAudioExperiment(): Promise<NetflixAudioCaptureStatus> {
@@ -33,6 +44,7 @@ export async function startNetflixAudioExperiment(): Promise<NetflixAudioCapture
   if (!response?.success || !response.data) {
     throw new Error(response?.error || 'Could not start tab audio capture.');
   }
+  await chrome.storage.session.remove('sentence_audio_setup_tab_id');
   return response.data;
 }
 

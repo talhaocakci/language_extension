@@ -2,6 +2,7 @@ import {
   NETFLIX_AUDIO_MESSAGES,
   type NetflixAudioCaptureStatus,
   type NetflixAudioClipMetadata,
+  type NetflixAudioClipData,
   type NetflixAudioExperimentResponse,
   type NetflixAudioRecordingSpec,
 } from './protocol';
@@ -36,6 +37,18 @@ export function findNetflixSentenceAudioClip(
   sentenceKey: string,
 ): Promise<NetflixAudioClipMetadata | null> {
   return sendAudioMessage(NETFLIX_AUDIO_MESSAGES.FIND_CLIP, { sentenceKey });
+}
+
+export function getNetflixSentenceAudioClipData(clipId: string): Promise<NetflixAudioClipData> {
+  return sendAudioMessage(NETFLIX_AUDIO_MESSAGES.GET_CLIP_DATA, { clipId });
+}
+
+export async function deleteNetflixSentenceAudioClip(clipId: string): Promise<void> {
+  await sendAudioMessage(NETFLIX_AUDIO_MESSAGES.DELETE_CLIP, { clipId });
+}
+
+export async function cleanupStaleNetflixSentenceAudioClips(): Promise<void> {
+  await sendAudioMessage(NETFLIX_AUDIO_MESSAGES.CLEANUP_STALE_CLIPS);
 }
 
 export async function playNetflixSentenceAudioClip(clipId: string): Promise<void> {

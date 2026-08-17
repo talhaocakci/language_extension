@@ -4,6 +4,7 @@ import {
   NETFLIX_AUDIO_OFFSCREEN_TARGET,
   type NetflixAudioCaptureStatus,
   type NetflixAudioClipMetadata,
+  type NetflixAudioClipData,
   type NetflixAudioExperimentResponse,
   type NetflixAudioRecordingSpec,
 } from './protocol';
@@ -11,6 +12,7 @@ import {
 const DB_NAME = 'GetFluentFastNetflixAudioExperiment';
 const DB_VERSION = 1;
 const CLIP_STORE = 'clips';
+const STALE_CLIP_AGE_MS = 24 * 60 * 60 * 1000;
 
 interface StoredNetflixAudioClip extends NetflixAudioClipMetadata {
   blob: Blob;
@@ -123,6 +125,56 @@ async function clearClips(): Promise<void> {
   } finally {
     db.close();
   }
+}
+
+async function deleteClip(clipId: string): Promise<void> {
+  const db = await openDatabase();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const transaction = db.transaction(CLIP_STORE, 'readwrite');
+      transaction.onerror = () => reject(transaction.error || new Error('Could not delete audio clip.'));
+      transaction.oncomplete = () => resolve();
+      transaction.objectStore(CLIP_STORE).delete(clipId);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+async function cleanupStaleClips(): Promise<number> {
+  const db = await openDatabase();
+  try {
+    return await new Promise<number>((resolve, reject) => {
+      let deleted = 0;
+      const transaction = db.transaction(CLIP_STORE, 'readwrite');
+      transaction.onerror = () => reject(transaction.error || new Error('Could not clean stale audio clips.'));
+      transaction.oncomplete = () => resolve(deleted);
+      const cutoff = IDBKeyRange.upperBound(Date.now() - STALE_CLIP_AGE_MS);
+      const request = transaction.objectStore(CLIP_STORE).index('createdAt').openKeyCursor(cutoff);
+      request.onerror = () => reject(request.error || new Error('Could not scan stale audio clips.'));
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) return;
+        transaction.objectStore(CLIP_STORE).delete(cursor.primaryKey);
+        deleted += 1;
+        cursor.continue();
+      };
+    });
+  } finally {
+    db.close();
+  }
+}
+
+async function clipToTransferData(clipId: string): Promise<NetflixAudioClipData> {
+  const clip = await getClip(clipId);
+  if (!clip) throw new Error('Captured audio clip was not found. Please save again.');
+  const bytes = new Uint8Array(await clip.blob.arrayBuffer());
+  let binary = '';
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  }
+  const { blob: _blob, ...metadata } = clip;
+  return { ...metadata, base64Data: btoa(binary) };
 }
 
 async function discardActiveRecording(): Promise<void> {
@@ -345,6 +397,16 @@ chrome.runtime.onMessage.addListener((message: MessageRequest, _sender, sendResp
           sendSuccess(sendResponse, metadata);
           break;
         }
+        case NETFLIX_AUDIO_MESSAGES.GET_CLIP_DATA:
+          sendSuccess(sendResponse, await clipToTransferData(String(message.payload?.clipId || '')));
+          break;
+        case NETFLIX_AUDIO_MESSAGES.DELETE_CLIP:
+          await deleteClip(String(message.payload?.clipId || ''));
+          sendSuccess(sendResponse, { deleted: true });
+          break;
+        case NETFLIX_AUDIO_MESSAGES.CLEANUP_STALE_CLIPS:
+          sendSuccess(sendResponse, { deleted: await cleanupStaleClips() });
+          break;
         case NETFLIX_AUDIO_MESSAGES.PLAY_CLIP:
           await playClip(String(message.payload?.clipId || ''));
           sendSuccess(sendResponse, { playing: true });
