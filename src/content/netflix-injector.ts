@@ -2,16 +2,34 @@ import type { MeaningfulSentence } from '../types/subtitle';
 import type { MessageRequest, MessageResponse, PlaybackControlPayload } from '../types/common';
 import { groupAndProcessSubtitles } from '../utils/subtitle-processor';
 import {
-  closeObservedSubtitleAtNextStart,
   type CapturedSubtitleChunk,
-  updateMatchingSubtitleTiming
+  upsertCapturedSubtitle
 } from '../utils/subtitle-timing';
+import {
+  DEFAULT_EXPLANATION_LANGUAGE,
+  detectLanguageCode,
+  EXPLANATION_LANGUAGE_STORAGE_KEY,
+  getLanguageFlag,
+  getLanguageLabel,
+  normalizeLanguagePreference,
+} from '../utils/language-preferences';
+import {
+  findNetflixSentenceAudioClip,
+  getNetflixSentenceAudioStatus,
+  playNetflixSentenceAudioClip,
+  recordNetflixSentenceAudioClip,
+} from '../experiments/netflix-audio/content-client';
+import {
+  NETFLIX_AUDIO_EXPERIMENT_ENABLED,
+  NETFLIX_AUDIO_MESSAGES,
+  type NetflixAudioClipMetadata,
+} from '../experiments/netflix-audio/protocol';
 
 let subtitleObserver: MutationObserver | null = null;
 let subtitleCaptureInterval: number | null = null;
 let overlayRefreshInterval: number | null = null;
-let lastCapturedSubtitleText = '';
-let lastPlaybackHref = '';
+let subtitleMutationTimer: number | null = null;
+let lastPlaybackSessionId = '';
 let collectedSubtitles: CapturedSubtitleChunk[] = [];
 let meaningfulSentences: MeaningfulSentence[] = [];
 let lastDetectedCaptionLanguageCode = '';
@@ -91,35 +109,25 @@ type OverlayNavDirection = 'prev' | 'repeat' | 'next';
 
 const OVERLAY_ID = 'subtitle-learning-onvideo-overlay';
 const WORD_POPUP_ID = 'subtitle-learning-word-popup';
+const STREAMING_TOGGLE_BTN_ID = 'subtitle-learning-player-toggle';
 const MIN_WORD_DURATION_MS = 320;
-const OVERLAY_TARGET_LANGUAGE_SELECT_ID = 'sl-overlay-target-language';
+const OVERLAY_TARGET_LANGUAGE_VALUE_ID = 'sl-overlay-target-language';
+const OVERLAY_HELP_ID = 'sl-overlay-help';
+const STREAMING_NATIVE_CAPTION_SUPPRESSION_STYLE_ID = 'sl-streaming-native-caption-suppression';
 const OVERLAY_ENABLE_WORD_HIGHLIGHTING = false;
 const SLOW_PLAYBACK_RATE = 0.75;
 const NORMAL_PLAYBACK_RATE = 1;
-
-const TARGET_LANGUAGE_LABELS: Record<string, string> = {
-  de: 'German',
-  en: 'English',
-  es: 'Spanish',
-  fr: 'French',
-  it: 'Italian',
-  pt: 'Portuguese',
-  tr: 'Turkish',
-  nl: 'Dutch',
-  ru: 'Russian',
-  ja: 'Japanese',
-  ko: 'Korean',
-  zh: 'Chinese',
-  ar: 'Arabic'
-};
 
 let overlayLastSentenceKey = '';
 let overlayLastWordIndex = -1;
 let overlayLastSentenceIndex = -1;
 let overlayLastRenderTimeMs = 0;
+let overlayLastAnchorSyncTimeMs = 0;
 let overlayStableSentenceIndex = -1;
 let overlayHidden = true;
 let overlayListenersBound = false;
+// Learning mode is opt-in for every title so casual streaming stays untouched.
+let overlayEnabled = false;
 
 let overlayCurrentSentence: MeaningfulSentence | null = null;
 let overlayExplainVisible = false;
@@ -128,15 +136,22 @@ let overlayExplainError: string | null = null;
 let overlayExplainAuthActionLoading = false;
 let overlayExplainAuthActionError: string | null = null;
 let overlayAnalysisSentenceKey = '';
-let overlayTargetLanguageCode = '';
-let overlayTargetLanguageManual = false;
+let overlayExplanationLanguage = DEFAULT_EXPLANATION_LANGUAGE;
 
 let overlayWordPopup: WordPopupState | null = null;
 let overlayWordLookupReqId = 0;
 
+type OverlayAudioExperimentState = 'checking' | 'unavailable' | 'ready' | 'recording' | 'saved' | 'playing' | 'error';
+let overlayAudioExperimentState: OverlayAudioExperimentState = 'checking';
+let overlayAudioExperimentSentenceKey = '';
+let overlayAudioExperimentClip: NetflixAudioClipMetadata | null = null;
+let overlayAudioExperimentError = '';
+let overlayAudioExperimentRequestId = 0;
+
 const wordMeaningCache: Record<string, WordMeaning> = {};
 const sentenceAnalysisCache: Record<string, SentenceAnalysis> = {};
 const overlaySaveState: Record<string, OverlaySaveState> = {};
+const overlaySaveError: Record<string, string> = {};
 
 const CASE_LABEL_DE: Record<string, string> = {
   nominative: 'Nominativ',
@@ -160,9 +175,11 @@ function detectPlatform(): StreamingPlatform {
 }
 
 const activePlatform: StreamingPlatform = detectPlatform();
+const STREAMING_NATIVE_CAPTION_SELECTOR = activePlatform === 'max'
+  ? '[data-testid="cueBoxRow"], [data-testid="cueBoxRowTextCue"], [data-testid="caption_renderer_overlay"], [class*="TextCue"]'
+  : '[data-uia="subtitle"], .player-timedtext, .watch-video [data-uia*="subtitle"], .lln-subs .lln-sub-text';
 
 function resetSubtitleState(): void {
-  lastCapturedSubtitleText = '';
   collectedSubtitles = [];
   meaningfulSentences = [];
   lastDetectedCaptionLanguageCode = '';
@@ -171,6 +188,7 @@ function resetSubtitleState(): void {
   overlayLastWordIndex = -1;
   overlayLastSentenceIndex = -1;
   overlayLastRenderTimeMs = 0;
+  overlayLastAnchorSyncTimeMs = 0;
   overlayStableSentenceIndex = -1;
 
   overlayCurrentSentence = null;
@@ -180,12 +198,20 @@ function resetSubtitleState(): void {
   overlayExplainAuthActionLoading = false;
   overlayExplainAuthActionError = null;
   overlayAnalysisSentenceKey = '';
-  overlayTargetLanguageCode = '';
-  overlayTargetLanguageManual = false;
 
   overlayWordPopup = null;
   overlayWordLookupReqId += 1;
+  overlayAudioExperimentState = 'checking';
+  overlayAudioExperimentSentenceKey = '';
+  overlayAudioExperimentClip = null;
+  overlayAudioExperimentError = '';
+  overlayAudioExperimentRequestId += 1;
+  for (const key of Object.keys(overlaySaveState)) delete overlaySaveState[key];
+  for (const key of Object.keys(overlaySaveError)) delete overlaySaveError[key];
 
+  overlayEnabled = false;
+  const toggle = document.getElementById(STREAMING_TOGGLE_BTN_ID) as HTMLButtonElement | null;
+  if (toggle) updateStreamingToggleState(toggle);
   hideOnVideoSentenceOverlay();
   renderOverlayWordPopup();
 }
@@ -322,82 +348,247 @@ function getSubtitleTextFromMediaTextTracks(): string {
 }
 
 function normalizeLanguageCode(value: string): string {
-  const lang = (value || '').trim().toLowerCase();
-  if (!lang) return '';
-  return lang.split(/[-_]/)[0] || '';
+  return detectLanguageCode(value);
 }
 
-function buildTargetLanguageOptions(
-  detectedCode: string,
-  selectedCode: string,
-): Array<{ code: string; label: string }> {
-  const baseCodes = Object.keys(TARGET_LANGUAGE_LABELS);
-  const set = new Set<string>(baseCodes);
-  if (detectedCode) set.add(detectedCode);
-  if (selectedCode) set.add(selectedCode);
-  return Array.from(set).map((code) => ({
-    code,
-    label: TARGET_LANGUAGE_LABELS[code] || code.toUpperCase(),
-  }));
-}
-
-function syncOverlayTargetLanguageFromCaptionTrack(): void {
-  const detected = getActiveSubtitleLanguageCodeFromTracks();
-  if (!detected) return;
-  if (!overlayTargetLanguageManual || !overlayTargetLanguageCode) {
-    overlayTargetLanguageCode = detected;
-  }
+function getLanguageCodeFromTrackMetadata(language: string, label: string): string {
+  return detectLanguageCode(language) || detectLanguageCode(label);
 }
 
 function getOverlayEffectiveTargetLanguage(): string {
-  return overlayTargetLanguageCode || lastDetectedCaptionLanguageCode || 'de';
+  return getPlayerLanguageCode();
+}
+
+const MEDIA_SECTION_HEADING_SELECTOR = [
+  'h1',
+  'h2',
+  'h3',
+  'h4',
+  '[role="heading"]',
+  '[data-uia*="header" i]',
+  '[data-uia*="title" i]',
+  '[data-testid*="header" i]',
+  '[data-testid*="title" i]',
+  '[class*="heading" i]',
+  '[class*="header" i]',
+  '[class*="title" i]',
+].join(',');
+
+const PLAYER_LANGUAGE_OPTION_SELECTOR = [
+  'button',
+  'li',
+  '[role="menuitemradio"]',
+  '[role="radio"]',
+  '[role="option"]',
+  '[data-uia*="item" i]',
+  '[data-testid*="item" i]',
+].join(',');
+
+const SUBTITLE_SECTION_PATTERN = /^(subtitles?|captions?|closed captions?|untertitel|sous-titres|subt[ií]tulos|sottotitoli|altyazılar?)$/iu;
+const AUDIO_SECTION_PATTERN = /^(audio|ses|ton|audios?)$/iu;
+
+function elementText(element: Element): string {
+  return normalizeSubtitleText((element as HTMLElement).innerText || element.textContent || '');
+}
+
+function elementMetadata(element: Element): string {
+  const htmlElement = element as HTMLElement;
+  return [
+    htmlElement.getAttribute('data-uia') || '',
+    htmlElement.getAttribute('data-testid') || '',
+    htmlElement.getAttribute('aria-label') || '',
+    typeof htmlElement.className === 'string' ? htmlElement.className : '',
+  ].join(' ').toLowerCase();
+}
+
+function selectedStateIsExplicit(element: Element): boolean {
+  const selectedAttributes = [
+    ['aria-checked', 'true'],
+    ['aria-selected', 'true'],
+    ['aria-current', 'true'],
+    ['data-state', 'checked'],
+    ['data-selected', 'true'],
+  ] as const;
+
+  if (selectedAttributes.some(([name, value]) => element.getAttribute(name) === value)) {
+    return true;
+  }
+  if (selectedAttributes.some(([name, value]) => element.querySelector(`[${name}="${value}"]`))) {
+    return true;
+  }
+
+  const selectionMetadata = `${elementMetadata(element)} ${Array.from(element.children)
+    .map((child) => elementMetadata(child))
+    .join(' ')}`;
+  if (/(^|[\s_-])(selected|checked|current)([\s_-]|$)/u.test(selectionMetadata)) {
+    return true;
+  }
+
+  // Netflix/Max render the selected option's check mark as an SVG without an
+  // ARIA selection attribute. Section classification below prevents an audio
+  // selection from being treated as the subtitle language.
+  return !!element.querySelector('svg');
+}
+
+function mediaSectionFromAncestors(element: Element): 'subtitle' | 'audio' | '' {
+  let current: Element | null = element;
+  for (let depth = 0; current && depth < 8; depth += 1, current = current.parentElement) {
+    const metadata = elementMetadata(current);
+    const mentionsSubtitle = /subtitle|caption/u.test(metadata);
+    const mentionsAudio = /audio/u.test(metadata);
+    if (mentionsSubtitle !== mentionsAudio) return mentionsSubtitle ? 'subtitle' : 'audio';
+
+    const headings = Array.from(current.querySelectorAll(MEDIA_SECTION_HEADING_SELECTOR))
+      .map((heading) => elementText(heading).toLowerCase())
+      .filter(Boolean);
+    const hasSubtitleHeading = headings.some((heading) => SUBTITLE_SECTION_PATTERN.test(heading));
+    const hasAudioHeading = headings.some((heading) => AUDIO_SECTION_PATTERN.test(heading));
+    if (hasSubtitleHeading !== hasAudioHeading) {
+      return hasSubtitleHeading ? 'subtitle' : 'audio';
+    }
+  }
+  return '';
+}
+
+function mediaSectionFromPosition(element: Element): 'subtitle' | 'audio' | '' {
+  const rect = element.getBoundingClientRect();
+  if (rect.width <= 0 && rect.height <= 0) return '';
+  const optionCenterX = rect.left + rect.width / 2;
+
+  const headings = Array.from(document.querySelectorAll(MEDIA_SECTION_HEADING_SELECTOR))
+    .map((heading) => ({ heading, text: elementText(heading).toLowerCase() }))
+    .filter(({ heading }) => isElementVisible(heading));
+  const distances = (pattern: RegExp): number[] => headings
+    .filter(({ text }) => pattern.test(text))
+    .map(({ heading }) => {
+      const headingRect = heading.getBoundingClientRect();
+      return Math.abs(optionCenterX - (headingRect.left + headingRect.width / 2));
+    });
+
+  const subtitleDistance = Math.min(...distances(SUBTITLE_SECTION_PATTERN), Number.POSITIVE_INFINITY);
+  const audioDistance = Math.min(...distances(AUDIO_SECTION_PATTERN), Number.POSITIVE_INFINITY);
+  if (!Number.isFinite(subtitleDistance)) return '';
+  if (!Number.isFinite(audioDistance) || subtitleDistance + 24 < audioDistance) return 'subtitle';
+  if (audioDistance + 24 < subtitleDistance) return 'audio';
+  return '';
+}
+
+function getSelectedSubtitleLanguageCodeFromPlayerMenu(): string | null {
+  const subtitleMenuIsVisible = Array.from(document.querySelectorAll(MEDIA_SECTION_HEADING_SELECTOR))
+    .some((heading) =>
+      isElementVisible(heading) && SUBTITLE_SECTION_PATTERN.test(elementText(heading).toLowerCase()),
+    );
+  if (!subtitleMenuIsVisible) return null;
+
+  const optionElements = new Set<Element>();
+  const explicitlySelected = document.querySelectorAll([
+    '[aria-checked="true"]',
+    '[aria-selected="true"]',
+    '[aria-current="true"]',
+    '[data-state="checked"]',
+    '[data-selected="true"]',
+    '[class*="selected" i]',
+    '[class*="checked" i]',
+    '[class*="current" i]',
+  ].join(','));
+
+  for (const selected of Array.from(explicitlySelected)) {
+    optionElements.add(selected.closest(PLAYER_LANGUAGE_OPTION_SELECTOR) || selected);
+  }
+  for (const option of Array.from(document.querySelectorAll(PLAYER_LANGUAGE_OPTION_SELECTOR))) {
+    if (selectedStateIsExplicit(option)) optionElements.add(option);
+  }
+
+  const detected = new Set<string>();
+  let hasExplicitSubtitleSelection = false;
+  for (const option of optionElements) {
+    if (!selectedStateIsExplicit(option)) continue;
+    const section = mediaSectionFromAncestors(option) || mediaSectionFromPosition(option);
+    if (section !== 'subtitle') continue;
+    hasExplicitSubtitleSelection = true;
+    const language = detectLanguageCode(elementText(option));
+    if (language) detected.add(language);
+  }
+
+  if (!hasExplicitSubtitleSelection) return null;
+  // An explicitly selected "Off"/unknown option, or multiple different
+  // selected subtitle languages, clears the target language. Do not retain a
+  // stale language or choose one.
+  return detected.size === 1 ? Array.from(detected)[0] : '';
+}
+
+function captureClickedSubtitleLanguage(target: EventTarget | null): void {
+  if (!(target instanceof Element)) return;
+  const option = target.closest(PLAYER_LANGUAGE_OPTION_SELECTOR);
+  if (!option) return;
+  const section = mediaSectionFromAncestors(option) || mediaSectionFromPosition(option);
+  if (section !== 'subtitle') return;
+
+  const language = detectLanguageCode(elementText(option));
+  lastDetectedCaptionLanguageCode = language;
+  if (language) {
+    console.info(`Selected subtitle language: ${getLanguageLabel(language)} (${language})`);
+  } else {
+    console.info('Selected subtitles are off or their language is unknown.');
+  }
+}
+
+function getLanguageCodeFromVisibleCaptionMetadata(): string {
+  const captionNodes = Array.from(document.querySelectorAll(STREAMING_NATIVE_CAPTION_SELECTOR))
+    .filter((node) => isElementVisible(node));
+  const detected = new Set<string>();
+
+  for (const captionNode of captionNodes) {
+    let current: Element | null = captionNode;
+    for (let depth = 0; current && depth < 4; depth += 1, current = current.parentElement) {
+      const language = getLanguageCodeFromTrackMetadata(
+        current.getAttribute('lang') || current.getAttribute('data-language') || current.getAttribute('data-lang') || '',
+        current.getAttribute('aria-label') || '',
+      );
+      if (language) detected.add(language);
+    }
+  }
+
+  return detected.size === 1 ? Array.from(detected)[0] : '';
 }
 
 function getActiveSubtitleLanguageCodeFromTracks(): string {
   const videoElement = getVideoElement();
-  if (!videoElement || !videoElement.textTracks || videoElement.textTracks.length === 0) {
-    return lastDetectedCaptionLanguageCode;
+  if (videoElement?.textTracks) {
+    const showingLanguages = new Set<string>();
+    const activeCueLanguages = new Set<string>();
+    for (let i = 0; i < videoElement.textTracks.length; i += 1) {
+      const track = videoElement.textTracks[i];
+      if (track.kind !== 'subtitles' && track.kind !== 'captions') continue;
+      const language = getLanguageCodeFromTrackMetadata(track.language || '', track.label || '');
+      if (!language) continue;
+      if (track.mode === 'showing') showingLanguages.add(language);
+      if (track.activeCues && track.activeCues.length > 0) activeCueLanguages.add(language);
+    }
+
+    if (showingLanguages.size === 1) return Array.from(showingLanguages)[0];
+    if (showingLanguages.size === 0 && activeCueLanguages.size === 1) {
+      return Array.from(activeCueLanguages)[0];
+    }
   }
 
-  const subtitleTracks: TextTrack[] = [];
-  for (let i = 0; i < videoElement.textTracks.length; i += 1) {
-    const track = videoElement.textTracks[i];
-    if (track.kind !== 'subtitles' && track.kind !== 'captions') continue;
-    subtitleTracks.push(track);
+  return '';
+}
 
-    const activeCues = track.activeCues;
-    if (!activeCues || activeCues.length === 0) continue;
-    const lang = normalizeLanguageCode(track.language || '');
-    if (!lang) continue;
-    lastDetectedCaptionLanguageCode = lang;
-    return lang;
+function getPlayerLanguageCode(): string {
+  const menuSelection = getSelectedSubtitleLanguageCodeFromPlayerMenu();
+  if (menuSelection !== null) {
+    lastDetectedCaptionLanguageCode = menuSelection;
+    return menuSelection;
   }
 
-  for (const track of subtitleTracks) {
-    if (track.mode !== 'showing') continue;
-    const lang = normalizeLanguageCode(track.language || '');
-    if (!lang) continue;
-    lastDetectedCaptionLanguageCode = lang;
-    return lang;
+  const detected =
+    getActiveSubtitleLanguageCodeFromTracks() ||
+    getLanguageCodeFromVisibleCaptionMetadata();
+  if (detected) {
+    lastDetectedCaptionLanguageCode = detected;
   }
-
-  for (const track of subtitleTracks) {
-    const lang = normalizeLanguageCode(track.language || '');
-    if (!lang) continue;
-    lastDetectedCaptionLanguageCode = lang;
-    return lang;
-  }
-
-  const domTrackNodes = videoElement.querySelectorAll('track[kind="subtitles"], track[kind="captions"]');
-  for (const node of Array.from(domTrackNodes)) {
-    const el = node as HTMLTrackElement;
-    const lang = normalizeLanguageCode(el.srclang || el.label || '');
-    if (!lang) continue;
-    lastDetectedCaptionLanguageCode = lang;
-    return lang;
-  }
-
-  return lastDetectedCaptionLanguageCode;
+  return detected || lastDetectedCaptionLanguageCode;
 }
 
 interface SubtitleDomProbe {
@@ -528,6 +719,9 @@ function extractSubtitlesFromNetflix(): CapturedSubtitleChunk[] {
   const subtitles: CapturedSubtitleChunk[] = [];
 
   try {
+    const videoElement = getVideoElement();
+    if (videoElement?.seeking) return subtitles;
+
     const mediaSubtitle = getActiveSubtitleFromMediaTextTracks();
     const text =
       activePlatform === 'max'
@@ -728,11 +922,18 @@ async function callOverlayLLM(
 }
 
 async function lookupWordInContext(word: string, sentence: string): Promise<WordMeaning> {
-  const systemPrompt = `You are a German teacher. The learner clicked a token in a German sentence.
+  const preferences = await chrome.runtime.sendMessage({ type: 'GET_LANGUAGE_PREFERENCES' });
+  const explanationLanguage = normalizeLanguagePreference(
+    preferences?.data?.explanationLanguage,
+    DEFAULT_EXPLANATION_LANGUAGE,
+  );
+  const targetLanguage = getOverlayEffectiveTargetLanguage() || 'auto-detect';
+  const systemPrompt = `You are a multilingual language teacher. The learner clicked a token in a ${targetLanguage} sentence.
+Write all learner-facing explanations in ${explanationLanguage}. Use German-specific grammar fields only when the sentence is German; otherwise return null for fields that do not apply.
 
 Return ONLY valid JSON with these keys (use null when not applicable):
 - "lemma": dictionary form / base form of the clicked word or its head noun.
-- "meaning": 1–2 short English sentences: meaning IN THIS CONTEXT.
+- "meaning": 1–2 short sentences in ${explanationLanguage}: meaning IN THIS CONTEXT.
 
 If the token is part of a **noun phrase** (article + optional adjective(s) + noun, or pronoun phrase), also fill:
 - "nounPhraseInSentence": the **full contiguous phrase exactly as it appears** in the sentence (include article, all adjectives, noun).
@@ -764,9 +965,18 @@ Always output valid JSON. No markdown, no extra keys.`;
 }
 
 async function analyseForPhrasalVerbs(sentence: string): Promise<SentenceAnalysis> {
+  const preferences = await chrome.runtime.sendMessage({ type: 'GET_LANGUAGE_PREFERENCES' });
+  const explanationLanguage = normalizeLanguagePreference(
+    preferences?.data?.explanationLanguage,
+    DEFAULT_EXPLANATION_LANGUAGE,
+  );
   const resp = (await chrome.runtime.sendMessage({
     type: 'OVERLAY_EXPLAIN_SENTENCE',
-    payload: { sentence }
+    payload: {
+      sentence,
+      targetLanguage: getOverlayEffectiveTargetLanguage(),
+      explanationLanguage,
+    }
   })) as MessageResponse<{ analysis: Record<string, unknown> }>;
 
   if (!resp?.success) {
@@ -831,12 +1041,14 @@ function buildSourceUrl(startTimeMs: number): string {
   }
 }
 
-function setOverlaySaveState(key: string, state?: OverlaySaveState): void {
+function setOverlaySaveState(key: string, state?: OverlaySaveState, error = ''): void {
   if (state) {
     overlaySaveState[key] = state;
   } else {
     delete overlaySaveState[key];
   }
+  if (state === 'error' && error) overlaySaveError[key] = error;
+  else if (state !== 'error') delete overlaySaveError[key];
   renderExplainPanel();
   renderOverlayWordPopup();
 }
@@ -879,15 +1091,19 @@ async function saveIdiomFromOverlay(
       return;
     }
 
-    console.error('SAVE_IDIOM failed:', resp?.error);
+    console.error('SAVE_IDIOM failed:', resp?.error, resp?.data);
     if (resp?.error && isAuthRequiredError(resp.error)) {
       void openExtensionPopupFromOverlay();
     }
-    setOverlaySaveState(canonicalForm, 'error');
+    setOverlaySaveState(canonicalForm, 'error', resp?.error || 'Could not add this item.');
     window.setTimeout(() => setOverlaySaveState(canonicalForm), 3000);
   } catch (error) {
     console.error('SAVE_IDIOM error:', error);
-    setOverlaySaveState(canonicalForm, 'error');
+    setOverlaySaveState(
+      canonicalForm,
+      'error',
+      error instanceof Error ? error.message : 'Could not reach the vocabulary service.',
+    );
     window.setTimeout(() => setOverlaySaveState(canonicalForm), 3000);
   }
 }
@@ -1054,10 +1270,24 @@ function bindOverlayGlobalListeners(): void {
   if (overlayListenersBound) return;
   overlayListenersBound = true;
 
+  // Capture the user's explicit subtitle choice before Netflix/Max closes and
+  // removes the language menu from the DOM.
+  document.addEventListener('click', (event) => {
+    captureClickedSubtitleLanguage(event.target);
+  }, true);
+
   document.addEventListener('mousedown', (event) => {
+    const target = event.target as Node | null;
+    const help = document.getElementById(OVERLAY_HELP_ID) as HTMLDivElement | null;
+    if (help && help.style.display !== 'none') {
+      const helpButton = help.parentElement?.querySelector('button[aria-label="Keyboard shortcuts"]');
+      if (!target || (!help.contains(target) && !helpButton?.contains(target))) {
+        help.style.display = 'none';
+      }
+    }
+
     if (!overlayWordPopup) return;
 
-    const target = event.target as Node | null;
     const popup = document.getElementById(WORD_POPUP_ID);
     if (popup && target && popup.contains(target)) {
       return;
@@ -1075,6 +1305,7 @@ function bindOverlayGlobalListeners(): void {
     if (event.defaultPrevented || event.repeat) return;
     if (event.ctrlKey || event.metaKey || event.altKey) return;
     if (isEditableElement(event.target)) return;
+    if (!overlayEnabled) return;
     if (meaningfulSentences.length === 0) return;
 
     const key = event.key.toLowerCase();
@@ -1090,8 +1321,195 @@ function bindOverlayGlobalListeners(): void {
     } else if (key === 's') {
       event.preventDefault();
       toggleSlowPlayback();
+    } else if (key === 'p') {
+      event.preventDefault();
+      const videoElement = getVideoElement();
+      if (videoElement) {
+        void applyPlaybackControl({ action: videoElement.paused ? 'play' : 'pause' });
+      }
     }
   });
+}
+
+function restoreStreamingNativeCaptions(): void {
+  document.getElementById(STREAMING_NATIVE_CAPTION_SUPPRESSION_STYLE_ID)?.remove();
+}
+
+function suppressStreamingNativeCaptions(): void {
+  if (document.getElementById(STREAMING_NATIVE_CAPTION_SUPPRESSION_STYLE_ID)) return;
+
+  const style = document.createElement('style');
+  style.id = STREAMING_NATIVE_CAPTION_SUPPRESSION_STYLE_ID;
+  style.textContent = activePlatform === 'max'
+    ? `
+      [data-testid="cueBoxRow"],
+      [data-testid="cueBoxRowTextCue"],
+      [data-testid="caption_renderer_overlay"],
+      [class*="TextCue"] {
+        opacity: 0 !important;
+        pointer-events: none !important;
+      }
+    `
+    : `
+      [data-uia="subtitle"],
+      .player-timedtext,
+      .watch-video [data-uia*="subtitle"],
+      .lln-subs .lln-sub-text {
+        opacity: 0 !important;
+        pointer-events: none !important;
+      }
+    `;
+  (document.head || document.documentElement).appendChild(style);
+}
+
+function syncStreamingOverlayWithPlayer(overlay: HTMLDivElement): void {
+  const videoRect = getVideoElement()?.getBoundingClientRect();
+  const hasPlayerBounds = !!videoRect && videoRect.width >= 240 && videoRect.height >= 135;
+  const playerLeft = hasPlayerBounds ? videoRect.left : 0;
+  const playerWidth = hasPlayerBounds ? videoRect.width : window.innerWidth;
+  const playerBottom = hasPlayerBounds ? videoRect.bottom : window.innerHeight;
+  const playerHeight = hasPlayerBounds ? videoRect.height : window.innerHeight;
+  const availableWidth = Math.max(280, playerWidth - 16);
+  const overlayWidth = Math.min(1080, playerWidth * 0.82, availableWidth);
+
+  overlay.style.width = `${overlayWidth}px`;
+  overlay.style.left = `${playerLeft + playerWidth / 2}px`;
+  overlay.style.top = 'auto';
+  overlay.style.bottom = `${Math.max(24, window.innerHeight - playerBottom + playerHeight * 0.13)}px`;
+  overlay.style.transform = 'translateX(-50%)';
+  suppressStreamingNativeCaptions();
+}
+
+// NETFLIX_AUDIO_EXPERIMENT: this entire block is an isolated player-UI adapter.
+function updateOverlayAudioExperimentButton(): void {
+  const button = document.querySelector('.sl-overlay-audio-experiment-btn') as HTMLButtonElement | null;
+  if (!button) return;
+
+  const labels: Record<OverlayAudioExperimentState, string> = {
+    checking: 'Audio…',
+    unavailable: '⚗ Audio',
+    ready: '🎙 Audio',
+    recording: '⏺ Audio',
+    saved: '▶ Clip',
+    playing: '🔊 Clip',
+    error: '! Audio',
+  };
+  button.textContent = labels[overlayAudioExperimentState];
+  button.disabled = overlayAudioExperimentState === 'checking' ||
+    overlayAudioExperimentState === 'recording' ||
+    overlayAudioExperimentState === 'playing';
+  button.title = overlayAudioExperimentError || (
+    overlayAudioExperimentState === 'unavailable'
+      ? 'Open the extension popup and enable the Netflix audio experiment for this tab.'
+      : overlayAudioExperimentState === 'saved'
+        ? 'Play the locally saved sentence audio clip.'
+        : 'Record this subtitle from the Netflix tab audio.'
+  );
+  button.setAttribute('aria-label', button.title);
+  button.style.opacity = button.disabled ? '0.68' : '1';
+}
+
+async function refreshOverlayAudioExperiment(sentence: MeaningfulSentence): Promise<void> {
+  if (!NETFLIX_AUDIO_EXPERIMENT_ENABLED) return;
+  const sentenceKey = getSentenceStableKey(sentence);
+  overlayAudioExperimentSentenceKey = sentenceKey;
+  overlayAudioExperimentState = 'checking';
+  overlayAudioExperimentClip = null;
+  overlayAudioExperimentError = '';
+  const requestId = ++overlayAudioExperimentRequestId;
+  updateOverlayAudioExperimentButton();
+
+  try {
+    const status = await getNetflixSentenceAudioStatus();
+    const clip = status.offscreenReady
+      ? await findNetflixSentenceAudioClip(sentenceKey)
+      : null;
+    if (requestId !== overlayAudioExperimentRequestId ||
+        sentenceKey !== overlayAudioExperimentSentenceKey) return;
+
+    overlayAudioExperimentClip = clip;
+    overlayAudioExperimentState = clip
+      ? 'saved'
+      : status.recording
+        ? 'recording'
+        : status.activeForCurrentTab
+          ? 'ready'
+          : 'unavailable';
+  } catch (error) {
+    if (requestId !== overlayAudioExperimentRequestId) return;
+    overlayAudioExperimentState = 'error';
+    overlayAudioExperimentError = error instanceof Error ? error.message : String(error);
+  }
+  updateOverlayAudioExperimentButton();
+}
+
+async function handleOverlayAudioExperimentClick(): Promise<void> {
+  const sentence = overlayCurrentSentence;
+  if (!sentence || !NETFLIX_AUDIO_EXPERIMENT_ENABLED) return;
+  const sentenceKey = getSentenceStableKey(sentence);
+
+  if (overlayAudioExperimentState === 'saved' && overlayAudioExperimentClip) {
+    overlayAudioExperimentState = 'playing';
+    overlayAudioExperimentError = '';
+    updateOverlayAudioExperimentButton();
+    try {
+      await playNetflixSentenceAudioClip(overlayAudioExperimentClip.clipId);
+      overlayAudioExperimentState = 'saved';
+    } catch (error) {
+      overlayAudioExperimentState = 'error';
+      overlayAudioExperimentError = error instanceof Error ? error.message : String(error);
+    }
+    updateOverlayAudioExperimentButton();
+    return;
+  }
+
+  if (overlayAudioExperimentState === 'unavailable') {
+    overlayAudioExperimentError = 'Enable the experiment for this tab in the extension popup.';
+    updateOverlayAudioExperimentButton();
+    await chrome.runtime.sendMessage({ type: 'OPEN_EXTENSION_POPUP' }).catch(() => undefined);
+    return;
+  }
+
+  if (overlayAudioExperimentState === 'error') {
+    await refreshOverlayAudioExperiment(sentence);
+    return;
+  }
+
+  if (overlayAudioExperimentState !== 'ready') return;
+  const video = getVideoElement();
+  if (!video) {
+    overlayAudioExperimentState = 'error';
+    overlayAudioExperimentError = 'Netflix video element was not found.';
+    updateOverlayAudioExperimentButton();
+    return;
+  }
+
+  overlayAudioExperimentState = 'recording';
+  overlayAudioExperimentError = '';
+  updateOverlayAudioExperimentButton();
+  try {
+    const clip = await recordNetflixSentenceAudioClip(video, {
+      sentenceKey,
+      sentenceText: sentence.text,
+      sourceUrl: buildSourceUrl(sentence.startTime),
+      videoTitle: document.title,
+      startTimeMs: sentence.startTime,
+      endTimeMs: sentence.endTime,
+    });
+    if (overlayAudioExperimentSentenceKey === sentenceKey) {
+      overlayAudioExperimentClip = clip;
+      overlayAudioExperimentState = 'saved';
+    }
+  } catch (error) {
+    if (overlayAudioExperimentSentenceKey === sentenceKey) {
+      overlayAudioExperimentState = 'error';
+      overlayAudioExperimentError = error instanceof Error ? error.message : String(error);
+    }
+  }
+  if (overlayAudioExperimentSentenceKey !== sentenceKey && overlayCurrentSentence) {
+    void refreshOverlayAudioExperiment(overlayCurrentSentence);
+  }
+  updateOverlayAudioExperimentButton();
 }
 
 function ensureOnVideoSentenceOverlay(): HTMLDivElement {
@@ -1109,8 +1527,8 @@ function ensureOnVideoSentenceOverlay(): HTMLDivElement {
     left: 50%;
     bottom: 19%;
     transform: translateX(-50%);
-    max-width: min(80vw, 1080px);
-    width: max-content;
+    width: min(82vw, 1080px);
+    max-width: calc(100vw - 16px);
     z-index: 2147483646;
     pointer-events: auto;
     opacity: 0;
@@ -1122,6 +1540,7 @@ function ensureOnVideoSentenceOverlay(): HTMLDivElement {
   const pill = document.createElement('div');
   pill.className = 'sl-overlay-pill';
   pill.style.cssText = `
+    position: relative;
     display: inline-flex;
     flex-direction: column;
     gap: 7px;
@@ -1133,6 +1552,8 @@ function ensureOnVideoSentenceOverlay(): HTMLDivElement {
     box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
     padding: 10px 14px;
     pointer-events: auto;
+    width: 100%;
+    box-sizing: border-box;
   `;
 
 
@@ -1145,82 +1566,54 @@ function ensureOnVideoSentenceOverlay(): HTMLDivElement {
     gap: 8px;
   `;
 
-  const createNavButton = (label: string, direction: OverlayNavDirection): HTMLButtonElement => {
+  const createToolbarButton = (label: string, title: string): HTMLButtonElement => {
     const button = document.createElement('button');
     button.type = 'button';
     button.textContent = label;
+    button.title = title;
+    button.setAttribute('aria-label', title);
     button.style.cssText = `
       pointer-events: auto;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 28px;
+      height: 25px;
+      padding: 0 7px;
       background: rgba(111, 143, 255, 0.16);
       border: 1px solid rgba(154, 181, 255, 0.48);
       color: #edf3ff;
       border-radius: 8px;
-      padding: 5px 10px;
       font-size: 12px;
       line-height: 1;
       font-weight: 600;
       cursor: pointer;
     `;
-    button.addEventListener('click', (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      void navigateOverlaySentence(direction);
-    });
+    button.addEventListener('mouseenter', () => { button.style.background = 'rgba(111, 143, 255, 0.22)'; });
+    button.addEventListener('mouseleave', () => { button.style.background = 'rgba(111, 143, 255, 0.16)'; });
     return button;
   };
 
-  controls.appendChild(createNavButton('⏮ Prev', 'prev'));
-  controls.appendChild(createNavButton('⟲ Repeat', 'repeat'));
-  controls.appendChild(createNavButton('⏭ Next', 'next'));
-
-  const targetLanguageLabel = document.createElement('label');
-  targetLanguageLabel.style.cssText = `
+  const targetLanguageFlag = document.createElement('span');
+  targetLanguageFlag.id = OVERLAY_TARGET_LANGUAGE_VALUE_ID;
+  targetLanguageFlag.style.cssText = `
     display: inline-flex;
     align-items: center;
-    gap: 6px;
-    color: rgba(232, 240, 255, 0.84);
-    font-size: 11px;
-    font-weight: 600;
-  `;
-  targetLanguageLabel.textContent = 'Target';
-
-  const targetLanguageSelect = document.createElement('select');
-  targetLanguageSelect.id = OVERLAY_TARGET_LANGUAGE_SELECT_ID;
-  targetLanguageSelect.style.cssText = `
-    pointer-events: auto;
-    border: 1px solid rgba(154, 181, 255, 0.44);
-    background: rgba(23, 31, 46, 0.9);
-    color: #edf3ff;
+    justify-content: center;
+    min-width: 28px;
+    height: 25px;
+    padding: 0 3px;
     border-radius: 6px;
-    font-size: 11px;
-    font-weight: 600;
-    padding: 3px 6px;
-    min-width: 112px;
-  `;
-  targetLanguageSelect.addEventListener('change', () => {
-    overlayTargetLanguageCode = normalizeLanguageCode(targetLanguageSelect.value);
-    overlayTargetLanguageManual = true;
-  });
-  targetLanguageLabel.appendChild(targetLanguageSelect);
-  controls.appendChild(targetLanguageLabel);
-
-  const explainBtn = document.createElement('button');
-  explainBtn.className = 'sl-overlay-explain-btn';
-  explainBtn.type = 'button';
-  explainBtn.textContent = '✨ Explain';
-  explainBtn.style.cssText = `
-    pointer-events: auto;
-    background: rgba(111, 143, 255, 0.16);
-    border: 1px solid rgba(154, 181, 255, 0.48);
     color: #edf3ff;
-    border-radius: 8px;
-    padding: 5px 10px;
-    font-size: 12px;
+    font-size: 17px;
     line-height: 1;
-    font-weight: 600;
-    cursor: pointer;
   `;
+  targetLanguageFlag.textContent = '🌐';
+  targetLanguageFlag.title = 'Detecting target language';
+  controls.appendChild(targetLanguageFlag);
 
+  const explainBtn = createToolbarButton('✨ Explain', 'Explain sentence');
+  explainBtn.className = 'sl-overlay-explain-btn';
   explainBtn.addEventListener('click', (event) => {
     event.preventDefault();
     event.stopPropagation();
@@ -1228,6 +1621,37 @@ function ensureOnVideoSentenceOverlay(): HTMLDivElement {
   });
 
   controls.appendChild(explainBtn);
+
+  const helpBtn = createToolbarButton('?', 'Keyboard shortcuts');
+  helpBtn.addEventListener('click', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const help = overlay.querySelector(`#${OVERLAY_HELP_ID}`) as HTMLDivElement | null;
+    if (help) help.style.display = help.style.display === 'none' ? 'grid' : 'none';
+  });
+  controls.appendChild(helpBtn);
+
+  const helpPanel = document.createElement('div');
+  helpPanel.id = OVERLAY_HELP_ID;
+  helpPanel.style.cssText = `
+    display: none;
+    grid-template-columns: auto auto;
+    gap: 5px 14px;
+    position: absolute;
+    right: 14px;
+    top: 42px;
+    z-index: 3;
+    min-width: 150px;
+    padding: 9px 11px;
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    border-radius: 9px;
+    background: rgba(8, 12, 18, 0.97);
+    box-shadow: 0 8px 22px rgba(0, 0, 0, 0.48);
+    color: #edf3ff;
+    font-size: 11px;
+    text-align: left;
+  `;
+  helpPanel.innerHTML = '<kbd>Q</kbd><span>Previous</span><kbd>W</kbd><span>Repeat</span><kbd>E</kbd><span>Next</span><kbd>P</kbd><span>Play / pause</span><kbd>S</kbd><span>Slow / normal speed</span>';
 
   const sentenceWrap = document.createElement('div');
   sentenceWrap.className = 'sl-overlay-sentence';
@@ -1239,6 +1663,10 @@ function ensureOnVideoSentenceOverlay(): HTMLDivElement {
     white-space: pre-wrap;
     word-wrap: break-word;
     text-shadow: 0 2px 10px rgba(0, 0, 0, 0.5);
+    min-height: 2.6em;
+    display: flex;
+    align-items: center;
+    justify-content: center;
   `;
 
   const explainPanel = document.createElement('div');
@@ -1256,6 +1684,7 @@ function ensureOnVideoSentenceOverlay(): HTMLDivElement {
   `;
 
   pill.appendChild(controls);
+  pill.appendChild(helpPanel);
   pill.appendChild(sentenceWrap);
   pill.appendChild(explainPanel);
 
@@ -1263,11 +1692,21 @@ function ensureOnVideoSentenceOverlay(): HTMLDivElement {
   document.body.appendChild(overlay);
 
   renderOverlayTargetLanguageControl();
+  void chrome.runtime.sendMessage({ type: 'GET_LANGUAGE_PREFERENCES' }).then((response) => {
+    overlayExplanationLanguage = normalizeLanguagePreference(
+      response?.data?.explanationLanguage,
+      DEFAULT_EXPLANATION_LANGUAGE,
+    );
+    renderOverlayTargetLanguageControl();
+  }).catch(() => undefined);
+
+  updateOverlayAudioExperimentButton();
 
   return overlay;
 }
 
 function hideOnVideoSentenceOverlay(): void {
+  restoreStreamingNativeCaptions();
   const overlay = document.getElementById(OVERLAY_ID) as HTMLDivElement | null;
   if (!overlay) {
     overlayHidden = true;
@@ -1279,11 +1718,95 @@ function hideOnVideoSentenceOverlay(): void {
   hideOverlayWordPopup();
 }
 
+function updateStreamingToggleState(button: HTMLButtonElement): void {
+  const label = overlayEnabled ? 'Learn CC: On' : 'Learn CC: Off';
+  if (button.textContent !== label) button.textContent = label;
+  button.title = overlayEnabled ? 'Turn off learning subtitles' : 'Turn on learning subtitles';
+  button.setAttribute('aria-label', button.title);
+  button.setAttribute('aria-pressed', String(overlayEnabled));
+  button.style.background = overlayEnabled
+    ? 'rgba(74, 105, 220, 0.9)'
+    : 'rgba(18, 22, 30, 0.82)';
+  button.style.borderColor = overlayEnabled
+    ? 'rgba(181, 198, 255, 0.95)'
+    : 'rgba(255, 255, 255, 0.42)';
+}
+
+function ensureStreamingToggleButton(): HTMLButtonElement | null {
+  const videoElement = getVideoElement();
+  const existing = document.getElementById(STREAMING_TOGGLE_BTN_ID) as HTMLButtonElement | null;
+  if (!videoElement) {
+    if (existing) existing.style.display = 'none';
+    return existing;
+  }
+
+  const videoRect = videoElement.getBoundingClientRect();
+  if (videoRect.width < 240 || videoRect.height < 135) {
+    if (existing) existing.style.display = 'none';
+    return existing;
+  }
+
+  const button = existing || document.createElement('button');
+  if (!existing) {
+    button.id = STREAMING_TOGGLE_BTN_ID;
+    button.type = 'button';
+    button.style.cssText = `
+      position: fixed;
+      z-index: 2147483647;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 34px;
+      padding: 7px 11px;
+      border: 1px solid;
+      border-radius: 8px;
+      color: #f5f7ff;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 12px;
+      line-height: 1;
+      font-weight: 700;
+      white-space: nowrap;
+      cursor: pointer;
+      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.38);
+      backdrop-filter: blur(4px);
+      -webkit-backdrop-filter: blur(4px);
+    `;
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      setStreamingOverlayEnabled(!overlayEnabled);
+    });
+    document.body.appendChild(button);
+  }
+
+  button.style.display = 'flex';
+  button.style.top = `${Math.max(10, videoRect.top + 14)}px`;
+  button.style.right = `${Math.max(10, window.innerWidth - videoRect.right + 14)}px`;
+  updateStreamingToggleState(button);
+  return button;
+}
+
+function setStreamingOverlayEnabled(enabled: boolean): void {
+  overlayEnabled = enabled;
+  ensureStreamingToggleButton();
+  if (overlayEnabled) {
+    collectAndProcessSubtitles();
+  } else {
+    hideOnVideoSentenceOverlay();
+  }
+}
+
 function getOverlayTargetSentence(currentTimeMs: number): {
   sentence: MeaningfulSentence;
   index: number;
 } | null {
   if (meaningfulSentences.length === 0) {
+    overlayStableSentenceIndex = -1;
+    return null;
+  }
+
+  const earliest = meaningfulSentences[0];
+  if (currentTimeMs < earliest.startTime - 250) {
     overlayStableSentenceIndex = -1;
     return null;
   }
@@ -1548,6 +2071,8 @@ function setExplainButtonState(): void {
 
   if (!overlayCurrentSentence) {
     btn.textContent = '✨ Explain';
+    btn.title = 'Explain sentence';
+    btn.setAttribute('aria-label', btn.title);
     btn.disabled = true;
     btn.style.opacity = '0.5';
     btn.style.cursor = 'default';
@@ -1560,6 +2085,8 @@ function setExplainButtonState(): void {
 
   if (overlayExplainLoading) {
     btn.textContent = '⏳ Analysing…';
+    btn.title = 'Analysing sentence';
+    btn.setAttribute('aria-label', btn.title);
     btn.disabled = true;
     btn.style.opacity = '0.85';
     btn.style.cursor = 'wait';
@@ -1570,30 +2097,25 @@ function setExplainButtonState(): void {
     overlayExplainVisible &&
     overlayCurrentSentence &&
     overlayAnalysisSentenceKey === getSentenceStableKey(overlayCurrentSentence);
-  btn.textContent = isVisibleForCurrent ? 'Hide Explain' : '✨ Explain';
+  btn.textContent = isVisibleForCurrent ? '× Hide' : '✨ Explain';
+  btn.title = isVisibleForCurrent ? 'Hide explanation' : 'Explain sentence';
+  btn.setAttribute('aria-label', btn.title);
 }
 
 function renderOverlayTargetLanguageControl(): void {
   const overlay = document.getElementById(OVERLAY_ID) as HTMLDivElement | null;
   if (!overlay) return;
 
-  const select = overlay.querySelector(
-    `#${OVERLAY_TARGET_LANGUAGE_SELECT_ID}`,
-  ) as HTMLSelectElement | null;
-  if (!select) return;
+  const value = overlay.querySelector(
+    `#${OVERLAY_TARGET_LANGUAGE_VALUE_ID}`,
+  ) as HTMLSpanElement | null;
+  if (!value) return;
 
-  const detected = lastDetectedCaptionLanguageCode;
-  const options = buildTargetLanguageOptions(detected, overlayTargetLanguageCode);
-  const effective = getOverlayEffectiveTargetLanguage();
-
-  select.innerHTML = '';
-  for (const opt of options) {
-    const option = document.createElement('option');
-    option.value = opt.code;
-    option.textContent = `${opt.label} (${opt.code})`;
-    select.appendChild(option);
-  }
-  select.value = effective;
+  const detected = getPlayerLanguageCode();
+  const targetLabel = detected ? `${getLanguageLabel(detected)} subtitles` : 'Target language not detected';
+  value.textContent = getLanguageFlag(detected);
+  value.title = targetLabel;
+  value.setAttribute('aria-label', value.title);
 }
 
 function createExplainSectionTitle(title: string): HTMLDivElement {
@@ -1723,7 +2245,7 @@ function renderExplainPanel(): void {
   }
 
   if (analysis.fixedPhrases.length > 0) {
-    panel.appendChild(createExplainSectionTitle('Phrases & Wendungen'));
+    panel.appendChild(createExplainSectionTitle('Phrases & grammar'));
     for (const phrase of analysis.fixedPhrases) {
       const row = document.createElement('div');
       row.style.cssText = 'margin-top:4px;padding:4px 6px;border-radius:6px;background:rgba(115,142,224,0.14);';
@@ -1750,7 +2272,9 @@ function renderExplainPanel(): void {
           ? 'Saved'
           : saveStatus === 'saving'
             ? 'Saving…'
-            : 'Save to vocabulary';
+            : saveStatus === 'error'
+              ? overlaySaveError[saveKey] || 'Could not add this item.'
+              : 'Save to vocabulary';
       saveBtn.textContent =
         saveStatus === 'saved'
           ? '✓'
@@ -1801,6 +2325,12 @@ function renderExplainPanel(): void {
 
       row.appendChild(top);
       row.appendChild(meaning);
+      if (saveStatus === 'error' && overlaySaveError[saveKey]) {
+        const saveError = document.createElement('div');
+        saveError.textContent = overlaySaveError[saveKey];
+        saveError.style.cssText = 'margin-top:3px;color:#ffb3b3;font-size:10px;';
+        row.appendChild(saveError);
+      }
       if (phrase.example) {
         const ex = document.createElement('div');
         ex.textContent = phrase.example;
@@ -1812,7 +2342,7 @@ function renderExplainPanel(): void {
   }
 
   if (analysis.phrasalVerbs.length > 0) {
-    panel.appendChild(createExplainSectionTitle('Trennbare Verben'));
+    panel.appendChild(createExplainSectionTitle('Phrasal & particle verbs'));
     for (const pv of analysis.phrasalVerbs) {
       const row = document.createElement('div');
       row.style.cssText = 'margin-top:4px;padding:4px 6px;border-radius:6px;background:rgba(107,166,255,0.12);';
@@ -1839,7 +2369,9 @@ function renderExplainPanel(): void {
           ? 'Saved'
           : saveStatus === 'saving'
             ? 'Saving…'
-            : 'Save to vocabulary';
+            : saveStatus === 'error'
+              ? overlaySaveError[saveKey] || 'Could not add this item.'
+              : 'Save to vocabulary';
       saveBtn.textContent =
         saveStatus === 'saved'
           ? '✓'
@@ -1885,6 +2417,12 @@ function renderExplainPanel(): void {
       top.appendChild(right);
 
       row.appendChild(top);
+      if (saveStatus === 'error' && overlaySaveError[saveKey]) {
+        const saveError = document.createElement('div');
+        saveError.textContent = overlaySaveError[saveKey];
+        saveError.style.cssText = 'margin-top:3px;color:#ffb3b3;font-size:10px;';
+        row.appendChild(saveError);
+      }
 
       const detail = document.createElement('div');
       detail.textContent = `${pv.prefix}- + ${pv.stem} · found as: ${pv.foundInText}`;
@@ -1903,7 +2441,7 @@ function renderExplainPanel(): void {
 
   if (analysis.fixedPhrases.length === 0 && analysis.phrasalVerbs.length === 0) {
     const note = document.createElement('div');
-    note.textContent = analysis.note || 'No separable verbs or fixed phrases detected.';
+    note.textContent = analysis.note || 'No learner-worthy phrases or grammar constructions detected.';
     note.style.color = '#d6e2ff';
     panel.appendChild(note);
     return;
@@ -1920,6 +2458,7 @@ function renderExplainPanel(): void {
 async function toggleExplainForCurrentSentence(forceRefresh = false): Promise<void> {
   const sentence = overlayCurrentSentence;
   if (!sentence) return;
+  await applyPlaybackControl({ action: 'pause' });
   const sentenceKey = getSentenceStableKey(sentence);
 
   const isCurrentVisible =
@@ -1934,8 +2473,6 @@ async function toggleExplainForCurrentSentence(forceRefresh = false): Promise<vo
     setExplainButtonState();
     return;
   }
-
-  await applyPlaybackControl({ action: 'pause' });
 
   overlayExplainVisible = true;
   overlayExplainError = null;
@@ -1995,6 +2532,7 @@ async function handleOverlayWordClick(
   event.preventDefault();
   event.stopPropagation();
   if (!clean) return;
+  await applyPlaybackControl({ action: 'pause' });
 
   const target = event.currentTarget as HTMLElement | null;
   const rect = target?.getBoundingClientRect();
@@ -2141,6 +2679,22 @@ function renderOverlaySentenceText(
 }
 
 function renderOnVideoSentenceOverlay(): void {
+  if (!document.getElementById(STREAMING_TOGGLE_BTN_ID)) {
+    ensureStreamingToggleButton();
+  }
+  if (!overlayEnabled) {
+    hideOnVideoSentenceOverlay();
+    return;
+  }
+
+  const videoElement = getVideoElement();
+  if (videoElement?.seeking) {
+    overlayStableSentenceIndex = -1;
+    overlayLastRenderTimeMs = 0;
+    hideOnVideoSentenceOverlay();
+    return;
+  }
+
   const currentTimeMs = getCurrentTimeMs();
   if (currentTimeMs === null) {
     hideOnVideoSentenceOverlay();
@@ -2169,6 +2723,7 @@ function renderOnVideoSentenceOverlay(): void {
     overlayExplainAuthActionError = null;
     overlayAnalysisSentenceKey = sentenceKey;
     hideOverlayWordPopup();
+    void refreshOverlayAudioExperiment(sentence);
   }
 
   const shouldRerender =
@@ -2178,6 +2733,13 @@ function renderOnVideoSentenceOverlay(): void {
     overlayHidden;
 
   if (!shouldRerender) {
+    renderOverlayTargetLanguageControl();
+    const now = performance.now();
+    if (now - overlayLastAnchorSyncTimeMs >= 350) {
+      const overlay = document.getElementById(OVERLAY_ID) as HTMLDivElement | null;
+      if (overlay) syncStreamingOverlayWithPlayer(overlay);
+      overlayLastAnchorSyncTimeMs = now;
+    }
     return;
   }
 
@@ -2192,17 +2754,25 @@ function renderOnVideoSentenceOverlay(): void {
   renderOverlayTargetLanguageControl();
   renderExplainPanel();
   setExplainButtonState();
+  updateOverlayAudioExperimentButton();
 
   overlay.style.opacity = '1';
   overlayHidden = false;
+  syncStreamingOverlayWithPlayer(overlay);
+  overlayLastAnchorSyncTimeMs = performance.now();
 
   overlayLastSentenceKey = sentenceKey;
   overlayLastWordIndex = activeWordIndex;
   overlayLastSentenceIndex = index;
 }
 
-function collectAndProcessSubtitles(): void {
-  syncOverlayTargetLanguageFromCaptionTrack();
+function collectAndProcessSubtitles(force = false): void {
+  if (!overlayEnabled && !force) {
+    hideOnVideoSentenceOverlay();
+    return;
+  }
+
+  getPlayerLanguageCode();
   const liveSubtitles = extractSubtitlesFromNetflix();
   if (liveSubtitles.length === 0) {
     renderOnVideoSentenceOverlay();
@@ -2210,27 +2780,45 @@ function collectAndProcessSubtitles(): void {
   }
 
   const latest = liveSubtitles[0];
-  const previous = collectedSubtitles[collectedSubtitles.length - 1];
-  if (previous && latest.text === previous.text) {
-    updateMatchingSubtitleTiming(previous, latest);
-    renderOnVideoSentenceOverlay();
-    return;
+  const timelineChanged = upsertCapturedSubtitle(collectedSubtitles, latest);
+  if (timelineChanged) {
+    meaningfulSentences = groupAndProcessSubtitles(collectedSubtitles);
   }
-
-  if (latest.text === lastCapturedSubtitleText) {
-    renderOnVideoSentenceOverlay();
-    return;
-  }
-
-  if (previous) {
-    closeObservedSubtitleAtNextStart(previous, latest.startTime);
-  }
-
-  collectedSubtitles.push(latest);
-  lastCapturedSubtitleText = latest.text;
-
-  meaningfulSentences = groupAndProcessSubtitles(collectedSubtitles);
   renderOnVideoSentenceOverlay();
+}
+
+function isExtensionOwnedNode(node: Node): boolean {
+  const element = node instanceof Element ? node : node.parentElement;
+  return !!element?.closest(
+    `#${OVERLAY_ID}, #${WORD_POPUP_ID}, #${STREAMING_TOGGLE_BTN_ID}`,
+  );
+}
+
+function mutationOnlyTouchesExtension(mutation: MutationRecord): boolean {
+  if (isExtensionOwnedNode(mutation.target)) return true;
+  if (mutation.type !== 'childList') return false;
+
+  const changedNodes = [
+    ...Array.from(mutation.addedNodes),
+    ...Array.from(mutation.removedNodes),
+  ];
+  return changedNodes.length > 0 && changedNodes.every(isExtensionOwnedNode);
+}
+
+function nodeTouchesNativeCaptions(node: Node): boolean {
+  const element = node instanceof Element ? node : node.parentElement;
+  if (!element) return false;
+  return !!element.closest(STREAMING_NATIVE_CAPTION_SELECTOR) ||
+    !!element.querySelector(STREAMING_NATIVE_CAPTION_SELECTOR);
+}
+
+function mutationTouchesNativeCaptions(mutation: MutationRecord): boolean {
+  if (nodeTouchesNativeCaptions(mutation.target)) return true;
+  if (mutation.type !== 'childList') return false;
+  return [
+    ...Array.from(mutation.addedNodes),
+    ...Array.from(mutation.removedNodes),
+  ].some(nodeTouchesNativeCaptions);
 }
 
 function setupSubtitleObserver(): void {
@@ -2243,10 +2831,21 @@ function setupSubtitleObserver(): void {
   if (overlayRefreshInterval !== null) {
     window.clearInterval(overlayRefreshInterval);
   }
+  if (subtitleMutationTimer !== null) {
+    window.clearTimeout(subtitleMutationTimer);
+    subtitleMutationTimer = null;
+  }
 
   try {
-    subtitleObserver = new MutationObserver(() => {
-      collectAndProcessSubtitles();
+    subtitleObserver = new MutationObserver((mutations) => {
+      if (mutations.every(mutationOnlyTouchesExtension)) return;
+      if (!mutations.some(mutationTouchesNativeCaptions)) return;
+      if (subtitleMutationTimer !== null) return;
+
+      subtitleMutationTimer = window.setTimeout(() => {
+        subtitleMutationTimer = null;
+        collectAndProcessSubtitles();
+      }, 60);
     });
 
     subtitleObserver.observe(document.body, {
@@ -2257,7 +2856,7 @@ function setupSubtitleObserver(): void {
 
     subtitleCaptureInterval = window.setInterval(() => {
       collectAndProcessSubtitles();
-    }, 250);
+    }, 500);
 
     overlayRefreshInterval = window.setInterval(() => {
       renderOnVideoSentenceOverlay();
@@ -2272,11 +2871,16 @@ function setupSubtitleObserver(): void {
 function initializeNetflixExtension(): void {
   console.log(`Initializing Subtitle Learning Extension for ${activePlatform}`);
 
-  lastPlaybackHref = window.location.href;
+  bindOverlayGlobalListeners();
+  lastPlaybackSessionId = getSessionId();
+  ensureStreamingToggleButton();
+  window.addEventListener('resize', ensureStreamingToggleButton, { passive: true });
+  document.addEventListener('fullscreenchange', ensureStreamingToggleButton);
   window.setInterval(() => {
-    const h = window.location.href;
-    if (h !== lastPlaybackHref) {
-      lastPlaybackHref = h;
+    ensureStreamingToggleButton();
+    const sessionId = getSessionId();
+    if (sessionId !== lastPlaybackSessionId) {
+      lastPlaybackSessionId = sessionId;
       resetSubtitleState();
     }
   }, 1000);
@@ -2292,7 +2896,10 @@ if (document.readyState === 'loading') {
 }
 
 chrome.runtime.onMessage.addListener((message: MessageRequest, sender, sendResponse) => {
-  if (message.type === 'GET_CURRENT_VIDEO') {
+  if (message.type === NETFLIX_AUDIO_MESSAGES.STATUS_CHANGED) {
+    if (overlayCurrentSentence) void refreshOverlayAudioExperiment(overlayCurrentSentence);
+    sendResponse({ success: true } as MessageResponse);
+  } else if (message.type === 'GET_CURRENT_VIDEO') {
     const videoElement = getVideoElement();
     const currentSessionId = getSessionId();
     sendResponse({
@@ -2302,19 +2909,23 @@ chrome.runtime.onMessage.addListener((message: MessageRequest, sender, sendRespo
         videoId: currentSessionId,
         sessionId: currentSessionId,
         currentTime: videoElement?.currentTime || 0,
-        duration: videoElement?.duration || 0
+        duration: videoElement?.duration || 0,
+        playerLanguageCode: getPlayerLanguageCode(),
       }
     } as MessageResponse);
   } else if (message.type === 'GET_SUBTITLES') {
-    collectAndProcessSubtitles();
+    // An explicit panel request is user intent even when the on-video overlay
+    // is off, so provide transcript data without enabling or showing it.
+    collectAndProcessSubtitles(true);
     const currentSessionId = getSessionId();
-    const captionLanguageCode = getActiveSubtitleLanguageCodeFromTracks();
+    const playerLanguageCode = getPlayerLanguageCode();
     sendResponse({
       success: true,
       data: {
         meaningfulSentences,
         subtitles: collectedSubtitles,
-        captionLanguageCode,
+        captionLanguageCode: playerLanguageCode,
+        playerLanguageCode,
         sessionId: currentSessionId,
         videoId: currentSessionId
       }
@@ -2334,4 +2945,19 @@ chrome.runtime.onMessage.addListener((message: MessageRequest, sender, sendRespo
     return true;
   }
   return true;
+});
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== 'sync' || !changes[EXPLANATION_LANGUAGE_STORAGE_KEY]) return;
+  overlayExplanationLanguage = normalizeLanguagePreference(
+    changes[EXPLANATION_LANGUAGE_STORAGE_KEY].newValue,
+    DEFAULT_EXPLANATION_LANGUAGE,
+  );
+  for (const key of Object.keys(sentenceAnalysisCache)) delete sentenceAnalysisCache[key];
+  for (const key of Object.keys(wordMeaningCache)) delete wordMeaningCache[key];
+  overlayExplainVisible = false;
+  overlayExplainError = null;
+  renderExplainPanel();
+  setExplainButtonState();
+  renderOverlayTargetLanguageControl();
 });

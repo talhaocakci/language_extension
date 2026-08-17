@@ -2,6 +2,12 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import ReactDOM from 'react-dom/client';
 import type { MeaningfulSentence, SubtitleChunk } from '../types/subtitle';
 import type { MessageRequest, PlaybackControlPayload } from '../types/common';
+import {
+  DEFAULT_EXPLANATION_LANGUAGE,
+  EXPLANATION_LANGUAGE_STORAGE_KEY,
+  getLanguageLabel,
+  normalizeLanguagePreference,
+} from '../utils/language-preferences';
 import './panel.css';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -131,6 +137,7 @@ interface SubtitleResponsePayload {
   subtitles?: SubtitleChunk[];
   videoId?: string;
   captionLanguageCode?: string;
+  playerLanguageCode?: string;
 }
 
 interface RefinedSentenceEntry {
@@ -201,17 +208,6 @@ const TARGET_LANGUAGE_LABELS: Record<string, string> = {
   ar: 'Arabic'
 };
 const ENABLE_WORD_HIGHLIGHTING = false;
-
-function buildTargetLanguageOptions(primaryCode: string, selectedCode: string): Array<{ code: string; label: string }> {
-  const baseCodes = Object.keys(TARGET_LANGUAGE_LABELS);
-  const set = new Set<string>(baseCodes);
-  if (primaryCode) set.add(primaryCode);
-  if (selectedCode) set.add(selectedCode);
-  return Array.from(set).map((code) => ({
-    code,
-    label: TARGET_LANGUAGE_LABELS[code] || code.toUpperCase(),
-  }));
-}
 
 /** Split visible text into words and whitespace; strip punctuation for lookup */
 function tokenizeSentence(text: string): WordToken[] {
@@ -460,8 +456,7 @@ function normalizeWordMeaning(raw: Record<string, unknown>, fallbackWord: string
 
 const API_BASE_URL = 'https://6b9x4wcwjh.execute-api.eu-central-1.amazonaws.com/prod';
 const ANALYZE_URL = `${API_BASE_URL}/analyze`;
-const EXPLAIN_URL = `${API_BASE_URL}/explain`;
-const EXPLAIN_PROMPT_ID = 'language_backend:tier3:explain_sentence';
+const LANGUAGE_TIER1_BASE_URL = 'https://api.getfluentfast.app';
 
 function normalizeApiError(status: number, raw: string): string {
   let message = raw;
@@ -524,12 +519,15 @@ async function callLLM(messages: { role: string; content: string }[], model = 'g
 async function lookupWordInContext(
   word: string,
   sentence: string,
+  targetLanguage: string,
+  explanationLanguage: string,
 ): Promise<WordMeaning> {
-  const systemPrompt = `You are a German teacher. The learner clicked a token in a German sentence.
+  const systemPrompt = `You are a multilingual language teacher. The learner clicked a token in a ${targetLanguage || 'detected-language'} sentence.
+Write all learner-facing explanations in ${explanationLanguage}. Use German-specific grammar fields only when the sentence is German; otherwise return null for fields that do not apply.
 
 Return ONLY valid JSON with these keys (use null when not applicable):
 - "lemma": dictionary form / base form of the clicked word or its head noun.
-- "meaning": 1–2 short English sentences: meaning IN THIS CONTEXT.
+- "meaning": 1–2 short sentences in ${explanationLanguage}: meaning IN THIS CONTEXT.
 
 If the token is part of a **noun phrase** (article + optional adjective(s) + noun, or pronoun phrase), also fill:
 - "nounPhraseInSentence": the **full contiguous phrase exactly as it appears** in the sentence (include article, all adjectives, noun).
@@ -563,27 +561,23 @@ Always output valid JSON. No markdown, no extra keys.`;
 
 async function analyseForPhrasalVerbs(
   sentence: string,
+  targetLanguage: string,
+  explanationLanguage: string,
 ): Promise<SentenceAnalysis> {
-  const token = await getIdToken();
-  const resp = await fetch(EXPLAIN_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify({
+  const resp = await chrome.runtime.sendMessage({
+    type: 'OVERLAY_EXPLAIN_SENTENCE',
+    payload: {
       sentence,
-      prompt_id: EXPLAIN_PROMPT_ID,
-    }),
+      targetLanguage,
+      explanationLanguage,
+    },
   });
 
-  if (!resp.ok) {
-    const err = normalizeApiError(resp.status, await resp.text());
-    throw new Error(err);
+  if (!resp?.success) {
+    throw new Error(resp?.error || 'Failed to explain sentence.');
   }
 
-  const json = await resp.json();
-  const parsed = (json?.analysis || json || {}) as Record<string, unknown>;
+  const parsed = (resp.data?.analysis || {}) as Record<string, unknown>;
   return normalizeSentenceAnalysis(parsed);
 }
 
@@ -658,8 +652,7 @@ function normalizeQuizEvaluateResult(raw: Record<string, unknown>): QuizEvaluate
 const PanelApp: React.FC = () => {
   const [allSentences, setAllSentences] = useState<MeaningfulSentence[]>([]);
   const [captionLanguageCode, setCaptionLanguageCode] = useState('');
-  const [selectedTargetLanguage, setSelectedTargetLanguage] = useState('');
-  const [isTargetLanguageManual, setIsTargetLanguageManual] = useState(false);
+  const [explanationLanguage, setExplanationLanguage] = useState(DEFAULT_EXPLANATION_LANGUAGE);
   const [isRefining, setIsRefining] = useState(false);
   const [currentSentenceIndex, setCurrentSentenceIndex] = useState<number>(-1);
   const [currentTime, setCurrentTime] = useState(0);
@@ -680,6 +673,7 @@ const PanelApp: React.FC = () => {
 
   // canonical_form → 'saving' | 'saved' | 'error'
   const [idiomSaveState, setIdiomSaveState] = useState<Record<string, 'saving' | 'saved' | 'error'>>({});
+  const [idiomSaveError, setIdiomSaveError] = useState<Record<string, string>>({});
   const [shadowBySentence, setShadowBySentence] = useState<Record<string, ShadowState>>({});
 
   const sentenceRefs = useRef<(HTMLDivElement | null)[]>([]);
@@ -721,8 +715,10 @@ const PanelApp: React.FC = () => {
       ? payload.meaningfulSentences
       : [];
     const rawChunks = Array.isArray(payload.subtitles) ? payload.subtitles : [];
-    const nextCaptionLanguage = typeof payload.captionLanguageCode === 'string'
-      ? normalizeLanguageCode(payload.captionLanguageCode)
+    const nextCaptionLanguage = typeof payload.playerLanguageCode === 'string'
+      ? normalizeLanguageCode(payload.playerLanguageCode)
+      : typeof payload.captionLanguageCode === 'string'
+        ? normalizeLanguageCode(payload.captionLanguageCode)
       : '';
     setCaptionLanguageCode(nextCaptionLanguage);
 
@@ -778,12 +774,6 @@ const PanelApp: React.FC = () => {
     sentencesRef.current = allSentences;
   }, [allSentences]);
 
-  useEffect(() => {
-    if (isTargetLanguageManual) return;
-    if (!captionLanguageCode) return;
-    setSelectedTargetLanguage(captionLanguageCode);
-  }, [captionLanguageCode, isTargetLanguageManual]);
-
   const initializePanel = useCallback(async () => {
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -808,6 +798,32 @@ const PanelApp: React.FC = () => {
     void initializePanel();
   }, [initializePanel]);
 
+  useEffect(() => {
+    void chrome.runtime.sendMessage({ type: 'GET_LANGUAGE_PREFERENCES' }).then((response) => {
+      if (!response?.success) return;
+      setExplanationLanguage(normalizeLanguagePreference(
+        response.data?.explanationLanguage,
+        DEFAULT_EXPLANATION_LANGUAGE,
+      ));
+    });
+
+    const onStorageChanged = (
+      changes: Record<string, chrome.storage.StorageChange>,
+      areaName: string,
+    ) => {
+      if (areaName !== 'sync' || !changes[EXPLANATION_LANGUAGE_STORAGE_KEY]) return;
+      setExplanationLanguage(normalizeLanguagePreference(
+        changes[EXPLANATION_LANGUAGE_STORAGE_KEY].newValue,
+        DEFAULT_EXPLANATION_LANGUAGE,
+      ));
+      setAnalysisCache({});
+      setExpandedCards({});
+      wordMeaningCache.current = {};
+    };
+    chrome.storage.onChanged.addListener(onStorageChanged);
+    return () => chrome.storage.onChanged.removeListener(onStorageChanged);
+  }, []);
+
   // Auto-scroll active sentence
   useEffect(() => {
     if (currentSentenceIndex >= 0 && sentenceRefs.current[currentSentenceIndex]) {
@@ -826,10 +842,19 @@ const PanelApp: React.FC = () => {
           type: 'GET_CURRENT_VIDEO'
         } as MessageRequest);
         if (response?.success && response.data) {
-          const data = response.data as { videoId?: string; currentTime?: number; platform?: string };
+          const data = response.data as {
+            videoId?: string;
+            currentTime?: number;
+            platform?: string;
+            playerLanguageCode?: string;
+          };
           const vid = data.videoId;
           const timeMs = (data.currentTime || 0) * 1000;
           setCurrentTime(timeMs);
+          const livePlayerLanguage = normalizeLanguageCode(data.playerLanguageCode || '');
+          if (livePlayerLanguage) {
+            setCaptionLanguageCode(livePlayerLanguage);
+          }
 
           if (vid) {
             if (lastVideoIdRef.current === null) {
@@ -846,8 +871,6 @@ const PanelApp: React.FC = () => {
               setExplainAuthPromptBySentence({});
               setShadowBySentence({});
               setCaptionLanguageCode('');
-              setSelectedTargetLanguage('');
-              setIsTargetLanguageManual(false);
               setWordPopup(null);
               setCurrentSentenceIndex(-1);
               setError(null);
@@ -866,7 +889,11 @@ const PanelApp: React.FC = () => {
             if (live?.success && live.data && Array.isArray(live.data?.meaningfulSentences)) {
               const nextSentences: MeaningfulSentence[] = live.data.meaningfulSentences;
               const currentSentences = sentencesRef.current;
+              const nextPlayerLanguage = normalizeLanguageCode(
+                live.data.playerLanguageCode || live.data.captionLanguageCode || '',
+              );
               const changed =
+                (!!nextPlayerLanguage && nextPlayerLanguage !== captionLanguageCode) ||
                 nextSentences.length !== currentSentences.length ||
                 (nextSentences.length > 0 &&
                   currentSentences.length > 0 &&
@@ -891,7 +918,7 @@ const PanelApp: React.FC = () => {
       }
     }, 500);
     return () => clearInterval(interval);
-  }, [activeTabId, allSentences, applySubtitlePayload, loadSentences, stopShadowRecorder]);
+  }, [activeTabId, allSentences, applySubtitlePayload, captionLanguageCode, loadSentences, stopShadowRecorder]);
 
   // Close word popup on click outside
   useEffect(() => {
@@ -910,6 +937,16 @@ const PanelApp: React.FC = () => {
     };
   }, [stopShadowRecorder]);
 
+  const sendPlaybackControl = useCallback(async (payload: PlaybackControlPayload) => {
+    if (!activeTabId) return;
+    try {
+      await chrome.tabs.sendMessage(activeTabId, {
+        type: 'PLAYBACK_CONTROL',
+        payload,
+      } as MessageRequest);
+    } catch {}
+  }, [activeTabId]);
+
   const handleWordClick = useCallback(
     async (
       e: React.MouseEvent,
@@ -919,9 +956,10 @@ const PanelApp: React.FC = () => {
     ) => {
       e.stopPropagation();
       if (!clean) return;
+      await sendPlaybackControl({ action: 'pause' });
 
       const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-      const cacheKey = `${sentence.id}|v3vp|${clean.toLowerCase()}`;
+      const cacheKey = `${sentence.id}|${captionLanguageCode}|${explanationLanguage}|v4|${clean.toLowerCase()}`;
       const cached = wordMeaningCache.current[cacheKey];
 
       setWordPopup({
@@ -946,7 +984,12 @@ const PanelApp: React.FC = () => {
       if (cached) return;
 
       try {
-        const result = await lookupWordInContext(clean, sentence.text);
+        const result = await lookupWordInContext(
+          clean,
+          sentence.text,
+          captionLanguageCode,
+          explanationLanguage,
+        );
         wordMeaningCache.current[cacheKey] = result;
         setWordPopup((p) =>
           p && p.sentenceId === sentence.id && p.word === clean
@@ -987,7 +1030,7 @@ const PanelApp: React.FC = () => {
         );
       }
     },
-    []
+    [captionLanguageCode, explanationLanguage, sendPlaybackControl]
   );
 
   const handleJumpToTime = async (startTimeMs: number) => {
@@ -996,16 +1039,6 @@ const PanelApp: React.FC = () => {
       timeMs: startTimeMs,
     });
   };
-
-  const sendPlaybackControl = useCallback(async (payload: PlaybackControlPayload) => {
-    if (!activeTabId) return;
-    try {
-      await chrome.tabs.sendMessage(activeTabId, {
-        type: 'PLAYBACK_CONTROL',
-        payload,
-      } as MessageRequest);
-    } catch {}
-  }, [activeTabId]);
 
   const resolveCurrentSentenceIndex = useCallback((): number => {
     if (allSentences.length === 0) return -1;
@@ -1070,16 +1103,13 @@ const PanelApp: React.FC = () => {
   const handleExplain = useCallback(async (sentence: MeaningfulSentence) => {
     const id = sentence.id;
     const isExpanded = Boolean(expandedCards[id]);
+    await sendPlaybackControl({ action: 'pause' });
 
     if (analysisCache[id]) {
-      if (!isExpanded) {
-        await sendPlaybackControl({ action: 'pause' });
-      }
       setExpandedCards(prev => ({ ...prev, [id]: !prev[id] }));
       return;
     }
 
-    await sendPlaybackControl({ action: 'pause' });
     setExplainAuthPromptBySentence((prev) => {
       if (!prev[id]) return prev;
       const next = { ...prev };
@@ -1089,7 +1119,11 @@ const PanelApp: React.FC = () => {
     setExpandedCards(prev => ({ ...prev, [id]: true }));
     setAnalysisLoading(prev => ({ ...prev, [id]: true }));
     try {
-      const result = await analyseForPhrasalVerbs(sentence.text);
+      const result = await analyseForPhrasalVerbs(
+        sentence.text,
+        captionLanguageCode,
+        explanationLanguage,
+      );
       setAnalysisCache(prev => ({ ...prev, [id]: result }));
     } catch (e: any) {
       const message = e?.message || 'Failed to explain sentence.';
@@ -1107,7 +1141,7 @@ const PanelApp: React.FC = () => {
     } finally {
       setAnalysisLoading(prev => ({ ...prev, [id]: false }));
     }
-  }, [analysisCache, expandedCards, sendPlaybackControl]);
+  }, [analysisCache, captionLanguageCode, expandedCards, explanationLanguage, sendPlaybackControl]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -1185,7 +1219,7 @@ const PanelApp: React.FC = () => {
     targetLanguage: string,
   ): Promise<QuizEvaluateResult> => {
     const token = await getIdToken();
-    const resp = await fetch(`${API_BASE_URL}/quiz/evaluate`, {
+    const resp = await fetch(`${LANGUAGE_TIER1_BASE_URL}/quiz/evaluate`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -1214,7 +1248,7 @@ const PanelApp: React.FC = () => {
         ...prev,
         [sentence.id]: {
           status: 'error',
-          error: 'Shadowing requires a detected caption-track language on this video.',
+          error: 'Shadowing requires the selected subtitle language to be detected on this video.',
         },
       }));
       return;
@@ -1271,8 +1305,7 @@ const PanelApp: React.FC = () => {
       [sentence.id]: { status: 'evaluating' },
     }));
     try {
-      const targetLanguage = selectedTargetLanguage || captionLanguageCode;
-      const result = await evaluateShadow(sentence, stopped.audioBase64, targetLanguage);
+      const result = await evaluateShadow(sentence, stopped.audioBase64, captionLanguageCode);
       setShadowBySentence((prev) => ({
         ...prev,
         [sentence.id]: { status: 'ready', result },
@@ -1283,7 +1316,7 @@ const PanelApp: React.FC = () => {
         [sentence.id]: { status: 'error', error: err?.message || 'Shadow evaluation failed.' },
       }));
     }
-  }, [captionLanguageCode, evaluateShadow, selectedTargetLanguage, stopShadowRecorder]);
+  }, [captionLanguageCode, evaluateShadow, stopShadowRecorder]);
 
   const handleSaveIdiom = useCallback(async (
     canonical_form: string,
@@ -1296,17 +1329,22 @@ const PanelApp: React.FC = () => {
     videoTitle: string,
   ) => {
     setIdiomSaveState(prev => ({ ...prev, [canonical_form]: 'saving' }));
+    setIdiomSaveError(prev => {
+      const next = { ...prev };
+      delete next[canonical_form];
+      return next;
+    });
     try {
       const resp: any = await chrome.runtime.sendMessage({
         type: 'SAVE_IDIOM',
         payload: {
-          target_language: selectedTargetLanguage || captionLanguageCode || 'de',
+          target_language: captionLanguageCode,
           canonical_form,
           found_in_text,
           kind,
           meaning,
           example: example || null,
-          language: selectedTargetLanguage || captionLanguageCode || 'de',
+          language: captionLanguageCode,
           source_sentence: sourceSentence,
           source_url: sourceUrl,
           video_title: videoTitle,
@@ -1316,12 +1354,16 @@ const PanelApp: React.FC = () => {
       if (resp?.success) {
         setIdiomSaveState(prev => ({ ...prev, [canonical_form]: 'saved' }));
       } else {
-        console.error('SAVE_IDIOM failed:', resp?.error);
+        console.error('SAVE_IDIOM failed:', resp?.error, resp?.data);
         if (typeof resp?.error === 'string' && isAuthRequiredError(resp.error)) {
           try {
             await chrome.runtime.sendMessage({ type: 'OPEN_EXTENSION_POPUP' });
           } catch {}
         }
+        setIdiomSaveError(prev => ({
+          ...prev,
+          [canonical_form]: typeof resp?.error === 'string' ? resp.error : 'Could not add this item.',
+        }));
         setIdiomSaveState(prev => ({ ...prev, [canonical_form]: 'error' }));
         setTimeout(() => setIdiomSaveState(prev => {
           const next = { ...prev };
@@ -1331,6 +1373,10 @@ const PanelApp: React.FC = () => {
       }
     } catch (e) {
       console.error('SAVE_IDIOM error:', e);
+      setIdiomSaveError(prev => ({
+        ...prev,
+        [canonical_form]: e instanceof Error ? e.message : 'Could not reach the vocabulary service.',
+      }));
       setIdiomSaveState(prev => ({ ...prev, [canonical_form]: 'error' }));
       setTimeout(() => setIdiomSaveState(prev => {
         const next = { ...prev };
@@ -1338,7 +1384,7 @@ const PanelApp: React.FC = () => {
         return next;
       }), 3000);
     }
-  }, [captionLanguageCode, selectedTargetLanguage]);
+  }, [captionLanguageCode]);
 
   const handleSaveWordFromPopup = useCallback(() => {
     if (!wordPopup) return;
@@ -1373,10 +1419,6 @@ const PanelApp: React.FC = () => {
   };
   const activeRecordingSentenceId =
     Object.entries(shadowBySentence).find(([, state]) => state.status === 'recording')?.[0] || null;
-  const targetLanguageOptions = buildTargetLanguageOptions(captionLanguageCode, selectedTargetLanguage);
-  const effectiveTargetLanguage =
-    selectedTargetLanguage || captionLanguageCode || targetLanguageOptions[0]?.code || 'de';
-
   // ── Render ────────────────────────────────────────────────────────────────
 
   if (isLoading) {
@@ -1430,24 +1472,21 @@ const PanelApp: React.FC = () => {
           </div>
         </div>
         <div style={styles.headerRight}>
-          <label style={styles.targetLanguageLabel}>
-            Target
-            <select
-              value={effectiveTargetLanguage}
-              style={styles.targetLanguageSelect}
-              onChange={(e) => {
-                const value = normalizeLanguageCode(e.target.value);
-                setSelectedTargetLanguage(value);
-                setIsTargetLanguageManual(true);
-              }}
-            >
-              {targetLanguageOptions.map((opt) => (
-                <option key={`target-lang-${opt.code}`} value={opt.code}>
-                  {opt.label} ({opt.code})
-                </option>
-              ))}
-            </select>
-          </label>
+          <span style={styles.targetLanguageLabel}>
+            Target {captionLanguageCode
+              ? `${TARGET_LANGUAGE_LABELS[captionLanguageCode] || captionLanguageCode.toUpperCase()} (${captionLanguageCode})`
+              : 'not detected'}
+          </span>
+          <span style={styles.targetLanguageLabel}>
+            Explain in {getLanguageLabel(explanationLanguage)}
+          </span>
+          <button
+            style={styles.profileBtn}
+            onClick={() => { void chrome.runtime.sendMessage({ type: 'OPEN_EXTENSION_POPUP' }); }}
+            title="Open profile and language settings"
+          >
+            👤 Profile
+          </button>
           <span style={{ color: '#999', fontSize: 12 }}>
             {allSentences.length} sentences
             {currentSentenceIndex >= 0 && ` · #${currentSentenceIndex + 1}`}
@@ -1457,7 +1496,7 @@ const PanelApp: React.FC = () => {
       </div>
       {!captionLanguageCode && (
         <div style={styles.shadowDisabledBanner}>
-          Shadowing is unavailable because caption-track language could not be detected on this video.
+          Shadowing is unavailable because the selected subtitle language could not be detected.
         </div>
       )}
 
@@ -1516,7 +1555,7 @@ const PanelApp: React.FC = () => {
                   }}
                   title={
                     !captionLanguageCode
-                      ? 'Caption-track language not detected'
+                      ? 'Selected subtitle language not detected'
                       : hasOtherRecording
                         ? 'Finish the current recording first'
                         : isEvaluatingThis
@@ -1685,7 +1724,7 @@ const PanelApp: React.FC = () => {
                 <div style={styles.analysisWrap}>
                   {(analysis.fixedPhrases?.length ?? 0) > 0 && (
                     <>
-                      <div style={styles.analysisSubheading}>Phrases & Wendungen</div>
+                      <div style={styles.analysisSubheading}>Phrases & grammar</div>
                       {(analysis.fixedPhrases ?? []).map((ph, i) => {
                         const saveKey = ph.canonicalForm;
                         const ss = idiomSaveState[saveKey];
@@ -1695,7 +1734,13 @@ const PanelApp: React.FC = () => {
                               <span style={styles.phraseCanon}>{ph.canonicalForm}</span>
                               <span style={styles.phraseKind}>{ph.kind}</span>
                               <button
-                                title={ss === 'saved' ? 'Saved' : ss === 'saving' ? 'Saving…' : 'Save to vocabulary'}
+                                title={ss === 'saved'
+                                  ? 'Saved'
+                                  : ss === 'saving'
+                                    ? 'Saving…'
+                                    : ss === 'error'
+                                      ? idiomSaveError[saveKey] || 'Could not add this item.'
+                                      : 'Save to vocabulary'}
                                 style={{
                                   ...styles.saveIdiomBtn,
                                   ...(ss === 'saved' ? styles.saveIdiomBtnSaved : {}),
@@ -1720,6 +1765,9 @@ const PanelApp: React.FC = () => {
                               „{ph.foundInText}“
                             </div>
                             <div style={styles.phraseMeaning}>{ph.meaning}</div>
+                            {ss === 'error' && idiomSaveError[saveKey] && (
+                              <div style={styles.saveIdiomError}>{idiomSaveError[saveKey]}</div>
+                            )}
                             {ph.example && (
                               <div style={styles.phraseExample}>{ph.example}</div>
                             )}
@@ -1731,7 +1779,7 @@ const PanelApp: React.FC = () => {
 
                   {(analysis.phrasalVerbs?.length ?? 0) > 0 && (
                     <>
-                      <div style={styles.analysisSubheading}>Trennbare Verben</div>
+                      <div style={styles.analysisSubheading}>Phrasal & particle verbs</div>
                       {analysis.phrasalVerbs.map((pv, i) => {
                         const saveKey = pv.baseForm;
                         const ss = idiomSaveState[saveKey];
@@ -1741,7 +1789,13 @@ const PanelApp: React.FC = () => {
                               <span style={styles.baseForm}>{pv.baseForm}</span>
                               <span style={styles.verbMeaning}>{pv.meaning}</span>
                               <button
-                                title={ss === 'saved' ? 'Saved' : ss === 'saving' ? 'Saving…' : 'Save to vocabulary'}
+                                title={ss === 'saved'
+                                  ? 'Saved'
+                                  : ss === 'saving'
+                                    ? 'Saving…'
+                                    : ss === 'error'
+                                      ? idiomSaveError[saveKey] || 'Could not add this item.'
+                                      : 'Save to vocabulary'}
                                 style={{
                                   ...styles.saveIdiomBtn,
                                   ...(ss === 'saved' ? styles.saveIdiomBtnSaved : {}),
@@ -1762,6 +1816,9 @@ const PanelApp: React.FC = () => {
                                 {ss === 'saved' ? '✓' : ss === 'saving' ? '…' : ss === 'error' ? '✕' : '＋'}
                               </button>
                             </div>
+                            {ss === 'error' && idiomSaveError[saveKey] && (
+                              <div style={styles.saveIdiomError}>{idiomSaveError[saveKey]}</div>
+                            )}
                             <div style={styles.verbDetail}>
                               <span style={styles.chip}>{pv.prefix}‑</span>
                               <span style={{ color: '#555', fontSize: 12 }}>+ </span>
@@ -1780,7 +1837,7 @@ const PanelApp: React.FC = () => {
                   {(analysis.phrasalVerbs?.length ?? 0) === 0 &&
                     (analysis.fixedPhrases?.length ?? 0) === 0 && (
                     <p style={styles.noteText}>
-                      {analysis.note || 'No separable verbs or fixed phrases detected.'}
+                      {analysis.note || 'No learner-worthy phrases or grammar constructions detected.'}
                     </p>
                   )}
                   {(analysis.phrasalVerbs?.length ?? 0) + (analysis.fixedPhrases?.length ?? 0) >
@@ -1998,15 +2055,15 @@ const styles: Record<string, React.CSSProperties> = {
     color: '#64748b',
     fontWeight: 600
   },
-  targetLanguageSelect: {
+  profileBtn: {
     border: '1px solid #cbd5e1',
     borderRadius: 6,
     backgroundColor: '#fff',
-    color: '#334155',
+    color: '#475569',
     fontSize: 11,
-    fontWeight: 600,
-    padding: '3px 6px',
-    minWidth: 92
+    fontWeight: 700,
+    padding: '4px 7px',
+    cursor: 'pointer'
   },
   list: { padding: '12px 12px 0', overflowY: 'auto' as const },
   card: {
@@ -2391,6 +2448,12 @@ const styles: Record<string, React.CSSProperties> = {
   saveIdiomBtnError: {
     border: '1px solid #dc2626',
     color: '#dc2626',
+  },
+  saveIdiomError: {
+    marginTop: 4,
+    color: '#b91c1c',
+    fontSize: 11,
+    lineHeight: 1.35,
   },
   phraseFound: { fontSize: 12, color: '#115e59', marginBottom: 4 },
   phraseMeaning: { fontSize: 12, color: '#334155', lineHeight: 1.45 },

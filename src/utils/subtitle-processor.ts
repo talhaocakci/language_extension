@@ -23,6 +23,12 @@ const GAP_ALWAYS_MERGE_INCOMPLETE_MS = 3200;
 const MAX_CHUNKS_PER_MEANINGFUL_SENTENCE = 5;
 
 /**
+ * Auto-generated YouTube captions often have no punctuation at all. Even when cue timing overlaps
+ * (so pause detection is unavailable), keep the learning overlay to a readable amount of text.
+ */
+const MAX_WORDS_PER_UNPUNCTUATED_GROUP = 18;
+
+/**
  * At most this many **complete** sentences (terminal . ! ? …) per card — avoids huge blocks of text.
  */
 const MAX_COMPLETE_SENTENCES_PER_CARD = 2;
@@ -61,6 +67,68 @@ function startsWithLowercaseSentence(text: string): boolean {
 
 const CONTINUATION_LAST_WORD = new Set(
   [
+    // English conjunctions, function words, and auxiliaries. These are especially important for
+    // YouTube ASR, where a cue can end in the middle of a verb phrase ("has" + "to encounter").
+    'and',
+    'or',
+    'but',
+    'because',
+    'if',
+    'unless',
+    'although',
+    'though',
+    'which',
+    'who',
+    'whom',
+    'whose',
+    'when',
+    'while',
+    'as',
+    'to',
+    'of',
+    'for',
+    'from',
+    'with',
+    'without',
+    'at',
+    'by',
+    'into',
+    'onto',
+    'about',
+    'over',
+    'under',
+    'a',
+    'the',
+    'my',
+    'your',
+    'his',
+    'her',
+    'our',
+    'their',
+    'am',
+    'is',
+    'are',
+    'was',
+    'were',
+    'be',
+    'been',
+    'being',
+    'have',
+    'has',
+    'had',
+    'do',
+    'does',
+    'did',
+    'can',
+    'could',
+    'will',
+    'would',
+    'shall',
+    'should',
+    'may',
+    'might',
+    'must',
+    'not',
     'und',
     'oder',
     'aber',
@@ -195,6 +263,28 @@ function looksIncompleteUtterance(text: string): boolean {
   return true;
 }
 
+/**
+ * Detect only high-confidence sentence starts that survive unpunctuated English ASR. This is kept
+ * deliberately conservative: it is a fallback for missing punctuation, not a grammar rewriter.
+ */
+function looksLikeUnpunctuatedSentenceStart(currentText: string, nextText: string): boolean {
+  if (looksLikeHardSentenceEnd(currentText) || countWords(currentText) < 3) return false;
+
+  const next = normalizeInlineSpacing(nextText).toLowerCase();
+  if (!next) return false;
+
+  // A determiner-led subject followed by a finite auxiliary is a strong new-clause signal, e.g.
+  // "the main character has ...". Limit the words between them to avoid splitting complements such
+  // as "the best thing I have ...".
+  if (/^(?:the|a|an)\s+(?:[\p{L}\p{N}'-]+\s+){0,2}(?:is|are|was|were|has|have|had|does|do|did|can|could|will|would|should|must|needs?|gets?|goes|wants?|says?)\b/u.test(next)) {
+    return true;
+  }
+
+  if (CONTINUATION_LAST_WORD.has(lastWordLower(currentText))) return false;
+
+  return /^(?:i(?:'m|'d|'ll|'ve)?|we(?:'re|'d|'ll|'ve)?|he(?:'s|'d|'ll)?|she(?:'s|'d|'ll)?|they(?:'re|'d|'ll|'ve)?|this|these|those|okay|ok|alright|meanwhile|finally|time\s+to|that's)\b/u.test(next);
+}
+
 function shouldBreakBeforeNext(
   current: SubtitleChunk,
   next: SubtitleChunk | undefined
@@ -210,6 +300,10 @@ function shouldBreakBeforeNext(
 
   // Clear sentence end → always start a new meaningful sentence
   if (hardEnd) return true;
+
+  // YouTube ASR frequently omits every punctuation mark and uses overlapping cue timings. In that
+  // case timing gaps are always zero, so use a few high-confidence textual starts as boundaries.
+  if (looksLikeUnpunctuatedSentenceStart(cur, next.text)) return true;
 
   // No . ! ? … — treat as same utterance if gaps are typical for YouTube (often 1–4 s)
   if (gap <= GAP_ALWAYS_MERGE_INCOMPLETE_MS) return false;
@@ -243,28 +337,12 @@ function looksLikeAsrSpaghetti(text: string): boolean {
   if (!normalized) return false;
 
   const wordCount = countWords(normalized);
-  if (wordCount < 5) return false;
+  if (wordCount < 3) return false;
 
   // If punctuation already exists, keep source formatting untouched.
   if (/[.!?]/.test(normalized)) return false;
 
-  // Heuristic: mostly lowercase starts indicate raw ASR stream.
-  const tokens = normalized.match(/\p{L}[\p{L}\p{N}'-]*/gu) || [];
-  if (tokens.length < 3) return false;
-
-  let lowercaseStarts = 0;
-  let uppercaseStarts = 0;
-  for (const token of tokens) {
-    const first = token[0];
-    if (!first) continue;
-    if (/[A-ZÄÖÜ]/u.test(first)) uppercaseStarts += 1;
-    if (/[a-zäöüß]/u.test(first)) lowercaseStarts += 1;
-  }
-
-  const total = lowercaseStarts + uppercaseStarts;
-  if (total === 0) return false;
-  const lowerRatio = lowercaseStarts / total;
-  return lowerRatio >= 0.75;
+  return true;
 }
 
 function capitalizeSentenceStarts(text: string): string {
@@ -332,12 +410,13 @@ function prettifyAsrGroup(chunks: SubtitleChunk[]): string {
 }
 
 /**
- * From every group **except the last**, peel **all** trailing cues that do not end with a hard
- * sentence ending (. ! ? …), and **prepend** them (in chronological order) to the next group.
+ * From every group **except the last**, carry trailing cues after its last completed sentence into
+ * the next group. Groups with no completed boundary are preserved because they were split by a
+ * hard readability limit.
  *
- * - Moves one trailing cue **or** several — e.g. three subtitle fragments without "." all roll forward.
- * - A single-cue group that is incomplete is moved entirely to the next card (this group dropped).
- * - One forward pass cascades: what lands at the end of group i+1 is re-evaluated when we get to i+1.
+ * - Moves one trailing cue **or** several after a `.?!` boundary.
+ * - Never moves an entirely unpunctuated group; doing so caused every YouTube ASR cue to cascade
+ *   into one giant final card.
  * - The **final** group is never peeled (no successor).
  */
 function peelIncompleteTailsForward(groups: SubtitleChunk[][]): SubtitleChunk[][] {
@@ -347,15 +426,21 @@ function peelIncompleteTailsForward(groups: SubtitleChunk[][]): SubtitleChunk[][
   const out: SubtitleChunk[][] = [];
 
   for (let i = 0; i < working.length; i++) {
-    let current = working[i];
+    const current = working[i];
 
     if (i < working.length - 1 && current.length > 0) {
-      const peeled: SubtitleChunk[] = [];
-      while (current.length > 0) {
-        const last = current[current.length - 1];
-        if (looksLikeHardSentenceEnd(last.text.trim())) {
+      // A group with no completed sentence was created by a hard readability limit (cue count,
+      // duration, or word count). Moving the whole group forward would erase that limit and cascade
+      // every unpunctuated ASR cue into the final card.
+      let lastCompleteIndex = -1;
+      for (let j = current.length - 1; j >= 0; j -= 1) {
+        if (looksLikeHardSentenceEnd(current[j].text.trim())) {
+          lastCompleteIndex = j;
           break;
         }
+      }
+      const peeled: SubtitleChunk[] = [];
+      while (lastCompleteIndex >= 0 && current.length - 1 > lastCompleteIndex) {
         peeled.push(current.pop()!);
       }
       if (peeled.length > 0) {
@@ -370,6 +455,33 @@ function peelIncompleteTailsForward(groups: SubtitleChunk[][]): SubtitleChunk[][
   }
 
   return out;
+}
+
+function splitUnpunctuatedGroupByWordCap(chunks: SubtitleChunk[]): SubtitleChunk[][] {
+  if (chunks.length <= 1 || /[.!?]/.test(mergeChunkTexts(chunks))) return [chunks];
+
+  const out: SubtitleChunk[][] = [];
+  let acc: SubtitleChunk[] = [];
+  let accWords = 0;
+
+  for (const chunk of chunks) {
+    const chunkWords = countWords(chunk.text);
+    if (acc.length > 0 && accWords + chunkWords > MAX_WORDS_PER_UNPUNCTUATED_GROUP) {
+      out.push(acc);
+      acc = [];
+      accWords = 0;
+    }
+
+    acc.push(chunk);
+    accWords += chunkWords;
+  }
+
+  if (acc.length > 0) out.push(acc);
+  return out;
+}
+
+function applyUnpunctuatedWordCapToGroups(groups: SubtitleChunk[][]): SubtitleChunk[][] {
+  return groups.flatMap(splitUnpunctuatedGroupByWordCap);
 }
 
 /**
@@ -630,7 +742,8 @@ export class SubtitleProcessor {
     }
 
     const peeled = peelIncompleteTailsForward(groups);
-    const durationCapped = applyDurationCapToGroups(peeled);
+    const wordCapped = applyUnpunctuatedWordCapToGroups(peeled);
+    const durationCapped = applyDurationCapToGroups(wordCapped);
     return applySentenceCapToGroups(durationCapped);
   }
 

@@ -7,6 +7,8 @@
     "dev": "webpack --mode development --watch",
     "start": "webpack serve --mode development",
     "type-check": "tsc --noEmit",
+    "test:language-preferences": "tsc tests/language-preferences.test.ts src/utils/language-preferences.ts --module commonjs --moduleResolution node --target ES2020 --outDir /tmp/language-extension-language-preference-tests --esModuleInterop --skipLibCheck && node --test /tmp/language-extension-language-preference-tests/tests/language-preferences.test.js",
+    "test:subtitle-processor": "tsc tests/subtitle-processor.test.ts src/utils/subtitle-processor.ts src/types/subtitle.ts --module commonjs --moduleResolution node --target ES2020 --outDir /tmp/language-extension-subtitle-processor-tests --esModuleInterop --skipLibCheck && NODE_PATH=./node_modules node --test /tmp/language-extension-subtitle-processor-tests/tests/subtitle-processor.test.js",
     "test:subtitle-timing": "tsc tests/subtitle-timing.test.ts src/utils/subtitle-timing.ts --module commonjs --moduleResolution node --target ES2020 --outDir /tmp/language-extension-subtitle-timing-tests --esModuleInterop --skipLibCheck && node --test /tmp/language-extension-subtitle-timing-tests/tests/subtitle-timing.test.js"
   },
   "dependencies": {

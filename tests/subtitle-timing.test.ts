@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   closeObservedSubtitleAtNextStart,
   type CapturedSubtitleChunk,
+  upsertCapturedSubtitle,
   updateMatchingSubtitleTiming
 } from '../src/utils/subtitle-timing';
 
@@ -66,4 +67,74 @@ test('a later caption does not truncate an exact overlapping media cue', () => {
   closeObservedSubtitleAtNextStart(previous, 32_000);
 
   assert.equal(previous.endTime, 33_000);
+});
+
+test('a caption captured after seeking backward is inserted chronologically', () => {
+  const subtitles: CapturedSubtitleChunk[] = [
+    {
+      text: 'Later caption',
+      startTime: 80_000,
+      endTime: 82_000,
+      timingSource: 'media-cue'
+    }
+  ];
+
+  upsertCapturedSubtitle(subtitles, {
+    text: 'Earlier caption',
+    startTime: 20_000,
+    endTime: 22_000,
+    timingSource: 'media-cue'
+  });
+
+  assert.deepEqual(subtitles.map((subtitle) => subtitle.text), [
+    'Earlier caption',
+    'Later caption'
+  ]);
+});
+
+test('revisiting the same cue after seeking does not duplicate it', () => {
+  const subtitles: CapturedSubtitleChunk[] = [
+    {
+      text: 'Same cue',
+      startTime: 20_000,
+      endTime: 22_000,
+      timingSource: 'media-cue'
+    },
+    {
+      text: 'Later cue',
+      startTime: 80_000,
+      endTime: 82_000,
+      timingSource: 'media-cue'
+    }
+  ];
+
+  const changed = upsertCapturedSubtitle(subtitles, {
+    text: 'Same cue',
+    startTime: 20_000,
+    endTime: 22_000,
+    timingSource: 'media-cue'
+  });
+
+  assert.equal(changed, false);
+  assert.equal(subtitles.length, 2);
+});
+
+test('identical text at a different time remains a separate caption', () => {
+  const subtitles: CapturedSubtitleChunk[] = [
+    {
+      text: 'Yes.',
+      startTime: 20_000,
+      endTime: 21_000,
+      timingSource: 'media-cue'
+    }
+  ];
+
+  upsertCapturedSubtitle(subtitles, {
+    text: 'Yes.',
+    startTime: 80_000,
+    endTime: 81_000,
+    timingSource: 'media-cue'
+  });
+
+  assert.equal(subtitles.length, 2);
 });

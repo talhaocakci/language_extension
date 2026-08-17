@@ -221,6 +221,34 @@ body {
   margin-bottom: 6px;
 }
 
+.profileAvatar {
+  width: 42px;
+  height: 42px;
+  flex: 0 0 42px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: #fff;
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.profileIdentity {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+}
+
+.profileName {
+  color: #1f2937;
+  font-size: 0.92rem;
+  font-weight: 700;
+}
+
 .authBadge {
   background: #48bb78;
   color: #fff;
@@ -247,6 +275,130 @@ body {
   display: flex;
   gap: 8px;
   margin-top: 8px;
+}
+
+.profilePreferences {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 16px;
+  margin-bottom: 18px;
+  border: 1px solid #e5e9ff;
+  border-radius: 10px;
+  background: #f7f9ff;
+}
+
+.profilePreferences label {
+  color: #4f5fc7;
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.profilePreferences select {
+  width: 100%;
+  padding: 9px 10px;
+  border: 1px solid #cfd6f5;
+  border-radius: 7px;
+  background: #fff;
+  color: #1f2937;
+  font: inherit;
+  font-size: 0.85rem;
+}
+
+.profilePreferences select:focus {
+  outline: none;
+  border-color: #667eea;
+  box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.12);
+}
+
+.profilePreferences small {
+  color: #667085;
+  font-size: 0.72rem;
+  line-height: 1.45;
+}
+
+/* NETFLIX_AUDIO_EXPERIMENT: delete this block with the experiment module. */
+.audioExperimentCard {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 14px;
+  margin-bottom: 18px;
+  border: 1px dashed #8d78d4;
+  border-radius: 10px;
+  background: #faf8ff;
+}
+
+.audioExperimentHeading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: #45358a;
+  font-size: 0.84rem;
+}
+
+.audioExperimentHeading span {
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: #eee9ff;
+  color: #604bb2;
+  font-size: 0.64rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.audioExperimentCard p {
+  margin: 0;
+  color: #625d75;
+  font-size: 0.72rem;
+  line-height: 1.45;
+}
+
+.audioExperimentStatus {
+  color: #777181;
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+
+.audioExperimentStatus.active {
+  color: #208451;
+}
+
+.audioExperimentActions {
+  display: flex;
+  gap: 7px;
+}
+
+.audioExperimentActions button {
+  flex: 1;
+  padding: 8px;
+  border: 1px solid #d7d1e7;
+  border-radius: 7px;
+  background: #fff;
+  color: #4b455b;
+  font-size: 0.7rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.audioExperimentActions button.primary {
+  border-color: #6755b6;
+  background: #6755b6;
+  color: #fff;
+}
+
+.audioExperimentActions button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.audioExperimentMessage {
+  color: #625d75;
+  font-size: 0.68rem;
+  line-height: 1.4;
 }
 
 .signOutBtn {
