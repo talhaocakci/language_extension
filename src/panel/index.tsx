@@ -3,9 +3,11 @@ import ReactDOM from 'react-dom/client';
 import type { MeaningfulSentence, SubtitleChunk } from '../types/subtitle';
 import type { MessageRequest, PlaybackControlPayload } from '../types/common';
 import {
+  BROWSER_EXTENSION_PREFERENCES_STORAGE_KEY,
   DEFAULT_EXPLANATION_LANGUAGE,
-  EXPLANATION_LANGUAGE_STORAGE_KEY,
+  getExplanationLanguageForTarget,
   getLanguageLabel,
+  normalizeBrowserExtensionPreferences,
   normalizeLanguagePreference,
 } from '../utils/language-preferences';
 import './panel.css';
@@ -799,7 +801,10 @@ const PanelApp: React.FC = () => {
   }, [initializePanel]);
 
   useEffect(() => {
-    void chrome.runtime.sendMessage({ type: 'GET_LANGUAGE_PREFERENCES' }).then((response) => {
+    void chrome.runtime.sendMessage({
+      type: 'GET_LANGUAGE_PREFERENCES',
+      payload: { targetLanguage: captionLanguageCode },
+    }).then((response) => {
       if (!response?.success) return;
       setExplanationLanguage(normalizeLanguagePreference(
         response.data?.explanationLanguage,
@@ -811,10 +816,12 @@ const PanelApp: React.FC = () => {
       changes: Record<string, chrome.storage.StorageChange>,
       areaName: string,
     ) => {
-      if (areaName !== 'sync' || !changes[EXPLANATION_LANGUAGE_STORAGE_KEY]) return;
-      setExplanationLanguage(normalizeLanguagePreference(
-        changes[EXPLANATION_LANGUAGE_STORAGE_KEY].newValue,
-        DEFAULT_EXPLANATION_LANGUAGE,
+      if (areaName !== 'sync' || !changes[BROWSER_EXTENSION_PREFERENCES_STORAGE_KEY]) return;
+      setExplanationLanguage(getExplanationLanguageForTarget(
+        normalizeBrowserExtensionPreferences(
+          changes[BROWSER_EXTENSION_PREFERENCES_STORAGE_KEY].newValue,
+        ),
+        captionLanguageCode,
       ));
       setAnalysisCache({});
       setExpandedCards({});
@@ -822,7 +829,7 @@ const PanelApp: React.FC = () => {
     };
     chrome.storage.onChanged.addListener(onStorageChanged);
     return () => chrome.storage.onChanged.removeListener(onStorageChanged);
-  }, []);
+  }, [captionLanguageCode]);
 
   // Auto-scroll active sentence
   useEffect(() => {

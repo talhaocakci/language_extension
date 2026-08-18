@@ -3,6 +3,7 @@ import ReactDOM from 'react-dom/client';
 import {
   DEFAULT_EXPLANATION_LANGUAGE,
   LANGUAGE_OPTIONS,
+  getLanguageLabel,
   normalizeLanguagePreference,
 } from '../utils/language-preferences';
 import {
@@ -29,6 +30,7 @@ const PopupApp: React.FC = () => {
   const [authError, setAuthError]   = useState('');
 
   const [saveMessage, setSaveMessage] = useState('');
+  const [targetLanguage, setTargetLanguage] = useState('');
   const [explanationLanguage, setExplanationLanguage] = useState(DEFAULT_EXPLANATION_LANGUAGE);
   const [audioExperimentStatus, setAudioExperimentStatus] = useState<NetflixAudioCaptureStatus | null>(null);
   const [audioExperimentBusy, setAudioExperimentBusy] = useState(false);
@@ -48,7 +50,17 @@ const PopupApp: React.FC = () => {
     try {
       const authResp = await chrome.runtime.sendMessage({ type: 'GET_AUTH_STATE' });
       if (authResp?.success) setAuth(authResp.data);
-      const preferencesResp = await chrome.runtime.sendMessage({ type: 'GET_LANGUAGE_PREFERENCES' });
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      let detectedTargetLanguage = '';
+      if (tab?.id) {
+        const videoResp = await chrome.tabs.sendMessage(tab.id, { type: 'GET_CURRENT_VIDEO' }).catch(() => null);
+        detectedTargetLanguage = normalizeLanguagePreference(videoResp?.data?.playerLanguageCode);
+      }
+      setTargetLanguage(detectedTargetLanguage);
+      const preferencesResp = await chrome.runtime.sendMessage({
+        type: 'GET_LANGUAGE_PREFERENCES',
+        payload: { targetLanguage: detectedTargetLanguage },
+      });
       if (preferencesResp?.success) {
         setExplanationLanguage(normalizeLanguagePreference(
           preferencesResp.data?.explanationLanguage,
@@ -91,13 +103,14 @@ const PopupApp: React.FC = () => {
   };
 
   const handleExplanationLanguageChange = async (value: string) => {
+    if (!targetLanguage) return;
     const nextLanguage = normalizeLanguagePreference(value, DEFAULT_EXPLANATION_LANGUAGE);
     setExplanationLanguage(nextLanguage);
     setSaveMessage('Saving…');
     try {
       const resp = await chrome.runtime.sendMessage({
         type: 'SET_LANGUAGE_PREFERENCES',
-        payload: { explanationLanguage: nextLanguage },
+        payload: { targetLanguage, explanationLanguage: nextLanguage },
       });
       setSaveMessage(resp?.success ? 'Explanation language updated' : (resp?.error || 'Could not save'));
     } catch (err) {
@@ -112,7 +125,7 @@ const PopupApp: React.FC = () => {
     try {
       const resp = await chrome.runtime.sendMessage({ type: 'COGNITO_LOGIN' });
       if (resp?.success) {
-        setAuth({ loggedIn: true, email: resp.data.email, tokenExpiry: 0 });
+        await loadAll();
       } else {
         setAuthError(resp?.error || 'Sign-in failed');
       }
@@ -235,11 +248,16 @@ const PopupApp: React.FC = () => {
             </div>
 
             <div className="profilePreferences">
-              <label htmlFor="explanation-language">Explanation language</label>
+              <label htmlFor="explanation-language">
+                {targetLanguage
+                  ? `${getLanguageLabel(targetLanguage)} explanation language`
+                  : 'Explanation language'}
+              </label>
               <select
                 id="explanation-language"
                 value={explanationLanguage}
                 onChange={(event) => { void handleExplanationLanguageChange(event.target.value); }}
+                disabled={!targetLanguage}
               >
                 {LANGUAGE_OPTIONS.map((option) => (
                   <option key={option.code} value={option.code}>
@@ -247,7 +265,11 @@ const PopupApp: React.FC = () => {
                   </option>
                 ))}
               </select>
-              <small>Meanings and explanation notes will be written in this language.</small>
+              <small>
+                {targetLanguage
+                  ? `Meanings for ${getLanguageLabel(targetLanguage)} subtitles will be written in this language.`
+                  : 'Open a supported video with subtitles to choose its explanation language.'}
+              </small>
               {saveMessage && <div className="saveMessage">{saveMessage}</div>}
             </div>
 

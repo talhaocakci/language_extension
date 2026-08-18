@@ -2,11 +2,13 @@ import type { SubtitleChunk, MeaningfulSentence } from '../types/subtitle';
 import type { MessageRequest, MessageResponse, PlaybackControlPayload } from '../types/common';
 import { groupAndProcessSubtitles } from '../utils/subtitle-processor';
 import {
+  BROWSER_EXTENSION_PREFERENCES_STORAGE_KEY,
   DEFAULT_EXPLANATION_LANGUAGE,
   detectLanguageCode,
-  EXPLANATION_LANGUAGE_STORAGE_KEY,
+  getExplanationLanguageForTarget,
   getLanguageFlag,
   getLanguageLabel,
+  normalizeBrowserExtensionPreferences,
   normalizeLanguagePreference,
 } from '../utils/language-preferences';
 
@@ -1129,11 +1131,15 @@ async function callOverlayLLM(
 }
 
 async function lookupWordInContext(word: string, sentence: string): Promise<WordMeaning> {
-  const preferences = await chrome.runtime.sendMessage({ type: 'GET_LANGUAGE_PREFERENCES' });
+  const preferences = await chrome.runtime.sendMessage({
+    type: 'GET_LANGUAGE_PREFERENCES',
+    payload: { targetLanguage: getOverlayEffectiveTargetLanguage() },
+  });
   const explanationLanguage = normalizeLanguagePreference(
     preferences?.data?.explanationLanguage,
     DEFAULT_EXPLANATION_LANGUAGE,
   );
+  overlayExplanationLanguage = explanationLanguage;
   const targetLanguage = getOverlayEffectiveTargetLanguage() || 'auto-detect';
   const systemPrompt = `You are a multilingual language teacher analysing a ${targetLanguage} sentence.
 Return ONLY JSON with keys:
@@ -1154,11 +1160,15 @@ No extra keys, no markdown.`;
 }
 
 async function analyseForPhrasalVerbs(sentence: string): Promise<SentenceAnalysis> {
-  const preferences = await chrome.runtime.sendMessage({ type: 'GET_LANGUAGE_PREFERENCES' });
+  const preferences = await chrome.runtime.sendMessage({
+    type: 'GET_LANGUAGE_PREFERENCES',
+    payload: { targetLanguage: getOverlayEffectiveTargetLanguage() },
+  });
   const explanationLanguage = normalizeLanguagePreference(
     preferences?.data?.explanationLanguage,
     DEFAULT_EXPLANATION_LANGUAGE,
   );
+  overlayExplanationLanguage = explanationLanguage;
   const resp = (await chrome.runtime.sendMessage({
     type: 'OVERLAY_EXPLAIN_SENTENCE',
     payload: {
@@ -2029,7 +2039,10 @@ function ensureYouTubeOverlay(): HTMLDivElement {
   overlay.appendChild(pill);
   document.body.appendChild(overlay);
   renderOverlayLanguagePair();
-  void chrome.runtime.sendMessage({ type: 'GET_LANGUAGE_PREFERENCES' }).then((response) => {
+  void chrome.runtime.sendMessage({
+    type: 'GET_LANGUAGE_PREFERENCES',
+    payload: { targetLanguage: getOverlayEffectiveTargetLanguage() },
+  }).then((response) => {
     overlayExplanationLanguage = normalizeLanguagePreference(
       response?.data?.explanationLanguage,
       DEFAULT_EXPLANATION_LANGUAGE,
@@ -2696,10 +2709,12 @@ chrome.runtime.onMessage.addListener((message: MessageRequest, sender, sendRespo
 });
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
-  if (areaName !== 'sync' || !changes[EXPLANATION_LANGUAGE_STORAGE_KEY]) return;
-  overlayExplanationLanguage = normalizeLanguagePreference(
-    changes[EXPLANATION_LANGUAGE_STORAGE_KEY].newValue,
-    DEFAULT_EXPLANATION_LANGUAGE,
+  if (areaName !== 'sync' || !changes[BROWSER_EXTENSION_PREFERENCES_STORAGE_KEY]) return;
+  overlayExplanationLanguage = getExplanationLanguageForTarget(
+    normalizeBrowserExtensionPreferences(
+      changes[BROWSER_EXTENSION_PREFERENCES_STORAGE_KEY].newValue,
+    ),
+    getOverlayEffectiveTargetLanguage(),
   );
   for (const key of Object.keys(sentenceAnalysisCache)) delete sentenceAnalysisCache[key];
   for (const key of Object.keys(wordMeaningCache)) delete wordMeaningCache[key];

@@ -1,5 +1,11 @@
 export const EXPLANATION_LANGUAGE_STORAGE_KEY = 'explanation_language';
+export const BROWSER_EXTENSION_PREFERENCES_STORAGE_KEY = 'browser_extension_preferences';
 export const DEFAULT_EXPLANATION_LANGUAGE = 'en';
+
+export interface BrowserExtensionPreferences {
+  explanation_language_by_target: Record<string, string>;
+  updated_at: string;
+}
 
 export const LANGUAGE_OPTIONS = [
   { code: 'en', label: 'English' },
@@ -53,6 +59,38 @@ export function normalizeLanguagePreference(value: unknown, fallback = ''): stri
   if (typeof value !== 'string') return fallback;
   const code = value.trim().toLowerCase().split(/[-_]/)[0] || '';
   return LANGUAGE_OPTIONS.some((option) => option.code === code) ? code : fallback;
+}
+
+export function normalizeBrowserExtensionPreferences(value: unknown): BrowserExtensionPreferences {
+  const raw = value && typeof value === 'object'
+    ? value as Record<string, unknown>
+    : {};
+  const languageMap = raw.explanation_language_by_target;
+  const explanationLanguageByTarget: Record<string, string> = {};
+
+  if (languageMap && typeof languageMap === 'object' && !Array.isArray(languageMap)) {
+    for (const [rawTarget, rawExplanation] of Object.entries(languageMap as Record<string, unknown>)) {
+      const target = normalizeLanguagePreference(rawTarget);
+      const explanation = normalizeLanguagePreference(rawExplanation);
+      if (target && explanation) explanationLanguageByTarget[target] = explanation;
+    }
+  }
+
+  return {
+    explanation_language_by_target: explanationLanguageByTarget,
+    updated_at: typeof raw.updated_at === 'string' ? raw.updated_at : '',
+  };
+}
+
+export function getExplanationLanguageForTarget(
+  preferences: BrowserExtensionPreferences,
+  targetLanguage: unknown,
+  fallback = DEFAULT_EXPLANATION_LANGUAGE,
+): string {
+  const target = normalizeLanguagePreference(targetLanguage);
+  return target
+    ? normalizeLanguagePreference(preferences.explanation_language_by_target[target], fallback)
+    : fallback;
 }
 
 export function getLanguageLabel(code: string): string {

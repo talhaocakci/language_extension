@@ -2,9 +2,13 @@ import type { MessageRequest, MessageResponse } from '../types/common';
 import type { SubtitleChunk, MeaningfulSentence } from '../types/subtitle';
 import { groupAndProcessSubtitles } from '../utils/subtitle-processor';
 import {
+  BROWSER_EXTENSION_PREFERENCES_STORAGE_KEY,
   DEFAULT_EXPLANATION_LANGUAGE,
   EXPLANATION_LANGUAGE_STORAGE_KEY,
+  type BrowserExtensionPreferences,
+  getExplanationLanguageForTarget,
   getLanguageLabel,
+  normalizeBrowserExtensionPreferences,
   normalizeLanguagePreference,
 } from '../utils/language-preferences';
 import {
@@ -47,12 +51,34 @@ const STORAGE_ID_TOKEN      = 'cognito_id_token';
 const STORAGE_REFRESH_TOKEN = 'cognito_refresh_token';
 const STORAGE_EXPIRY        = 'cognito_token_expiry';  // ms epoch
 
-async function getExplanationLanguage(): Promise<string> {
-  const stored = await chrome.storage.sync.get(EXPLANATION_LANGUAGE_STORAGE_KEY);
-  return normalizeLanguagePreference(
+async function getBrowserExtensionPreferences(): Promise<BrowserExtensionPreferences> {
+  const stored = await chrome.storage.sync.get(BROWSER_EXTENSION_PREFERENCES_STORAGE_KEY);
+  return normalizeBrowserExtensionPreferences(stored[BROWSER_EXTENSION_PREFERENCES_STORAGE_KEY]);
+}
+
+async function storeBrowserExtensionPreferences(
+  preferences: BrowserExtensionPreferences,
+): Promise<BrowserExtensionPreferences> {
+  const normalized = normalizeBrowserExtensionPreferences(preferences);
+  await chrome.storage.sync.set({
+    [BROWSER_EXTENSION_PREFERENCES_STORAGE_KEY]: normalized,
+  });
+  return normalized;
+}
+
+async function getExplanationLanguage(targetLanguage?: unknown): Promise<string> {
+  const stored = await chrome.storage.sync.get([
+    BROWSER_EXTENSION_PREFERENCES_STORAGE_KEY,
+    EXPLANATION_LANGUAGE_STORAGE_KEY,
+  ]);
+  const preferences = normalizeBrowserExtensionPreferences(
+    stored[BROWSER_EXTENSION_PREFERENCES_STORAGE_KEY],
+  );
+  const legacyFallback = normalizeLanguagePreference(
     stored[EXPLANATION_LANGUAGE_STORAGE_KEY],
     DEFAULT_EXPLANATION_LANGUAGE,
   );
+  return getExplanationLanguageForTarget(preferences, targetLanguage, legacyFallback);
 }
 
 // ── Auth helpers ──────────────────────────────────────────────────────────────
@@ -228,7 +254,7 @@ function normalizeLearnItemError(status: number, raw: string): { message: string
 
 async function authenticatedTier1Json(
   path: string,
-  method: 'GET' | 'POST',
+  method: 'GET' | 'POST' | 'PUT',
   body?: Record<string, unknown>,
 ): Promise<{ response: Response; text: string }> {
   let token = await getValidIdToken();
@@ -251,6 +277,42 @@ async function authenticatedTier1Json(
     }
   }
   return { response, text: await response.text() };
+}
+
+function browserPreferencesTimestamp(preferences: BrowserExtensionPreferences): number {
+  const parsed = Date.parse(preferences.updated_at);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+async function pushBrowserExtensionPreferences(
+  preferences: BrowserExtensionPreferences,
+): Promise<BrowserExtensionPreferences> {
+  const { response, text } = await authenticatedTier1Json(
+    '/profile/client-preferences/browser-extension',
+    'PUT',
+    { explanation_language_by_target: preferences.explanation_language_by_target },
+  );
+  if (!response.ok) throw new Error(normalizeApiError(response.status, text));
+  return storeBrowserExtensionPreferences(normalizeBrowserExtensionPreferences(JSON.parse(text)));
+}
+
+async function syncBrowserExtensionPreferences(): Promise<BrowserExtensionPreferences> {
+  const local = await getBrowserExtensionPreferences();
+  const { response, text } = await authenticatedTier1Json(
+    '/profile/client-preferences/browser-extension',
+    'GET',
+  );
+  if (response.status === 404) return local;
+  if (!response.ok) throw new Error(normalizeApiError(response.status, text));
+
+  const remote = normalizeBrowserExtensionPreferences(JSON.parse(text));
+  if (
+    Object.keys(local.explanation_language_by_target).length > 0
+    && browserPreferencesTimestamp(local) > browserPreferencesTimestamp(remote)
+  ) {
+    return pushBrowserExtensionPreferences(local);
+  }
+  return storeBrowserExtensionPreferences(remote);
 }
 
 chrome.tabs.onRemoved.addListener((tabId) => {
@@ -312,9 +374,14 @@ chrome.runtime.onMessage.addListener((message: MessageRequest, sender, sendRespo
 
     if (message.type === 'GET_LANGUAGE_PREFERENCES') {
       (async () => {
+        const targetLanguage = normalizeLanguagePreference(message.payload?.targetLanguage);
         sendResponse({
           success: true,
-          data: { explanationLanguage: await getExplanationLanguage() },
+          data: {
+            targetLanguage,
+            explanationLanguage: await getExplanationLanguage(targetLanguage),
+            preferences: await getBrowserExtensionPreferences(),
+          },
         });
       })();
       return true;
@@ -322,14 +389,36 @@ chrome.runtime.onMessage.addListener((message: MessageRequest, sender, sendRespo
 
     if (message.type === 'SET_LANGUAGE_PREFERENCES') {
       (async () => {
+        const targetLanguage = normalizeLanguagePreference(message.payload?.targetLanguage);
+        if (!targetLanguage) {
+          sendResponse({ success: false, error: 'Target language is required.' });
+          return;
+        }
         const explanationLanguage = normalizeLanguagePreference(
           message.payload?.explanationLanguage,
           DEFAULT_EXPLANATION_LANGUAGE,
         );
-        await chrome.storage.sync.set({
-          [EXPLANATION_LANGUAGE_STORAGE_KEY]: explanationLanguage,
+        const preferences = await getBrowserExtensionPreferences();
+        const nextPreferences = await storeBrowserExtensionPreferences({
+          explanation_language_by_target: {
+            ...preferences.explanation_language_by_target,
+            [targetLanguage]: explanationLanguage,
+          },
+          updated_at: new Date().toISOString(),
         });
-        sendResponse({ success: true, data: { explanationLanguage } });
+        let synced = false;
+        if (await getValidIdToken()) {
+          try {
+            await pushBrowserExtensionPreferences(nextPreferences);
+            synced = true;
+          } catch (error) {
+            console.warn('Could not sync browser extension preferences:', error);
+          }
+        }
+        sendResponse({
+          success: true,
+          data: { targetLanguage, explanationLanguage, preferences: nextPreferences, synced },
+        });
       })();
       return true;
     }
@@ -574,7 +663,7 @@ chrome.runtime.onMessage.addListener((message: MessageRequest, sender, sendRespo
           );
           const explanationLanguage = normalizeLanguagePreference(
             message.payload?.explanationLanguage || message.payload?.explanation_language,
-            await getExplanationLanguage(),
+            await getExplanationLanguage(targetLanguage),
           );
 
           const targetLanguageLabel = targetLanguage
@@ -644,6 +733,9 @@ If nothing learner-worthy is found, return empty arrays. Do not invent translati
       (async () => {
         try {
           const result = await cognitoLogin();
+          await syncBrowserExtensionPreferences().catch((error) => {
+            console.warn('Could not restore browser extension preferences:', error);
+          });
           sendResponse({ success: true, data: result });
         } catch (err) {
           sendResponse({ success: false, error: String(err) });
@@ -674,6 +766,9 @@ If nothing learner-worthy is found, return empty arrays. Do not invent translati
             sendResponse({ success: true, data: { loggedIn: false } });
             return;
           }
+          await syncBrowserExtensionPreferences().catch((error) => {
+            console.warn('Could not refresh browser extension preferences:', error);
+          });
           sendResponse({
             success: true,
             data: {
@@ -779,6 +874,78 @@ If nothing learner-worthy is found, return empty arrays. Do not invent translati
               data: { ...data, code: duplicate ? 'SENTENCE_ALREADY_SAVED' : normalized.code },
             });
             return;
+          }
+          sendResponse({ success: true, data });
+        } catch (err) {
+          sendResponse({ success: false, error: err instanceof Error ? err.message : String(err) });
+        }
+      })();
+      return true;
+    }
+
+    if (message.type === 'UPLOAD_SENTENCE_AUDIO') {
+      (async () => {
+        try {
+          const payload = (message.payload || {}) as Record<string, any>;
+          const itemId = String(payload.item_id || '').trim();
+          const upload = (payload.upload || {}) as Record<string, any>;
+          const clip = (payload.clip || {}) as Record<string, any>;
+          const uploadUrl = String(upload.url || '').trim();
+          const s3Key = String(upload.s3_key || '').trim();
+          const mimeType = String(clip.mime_type || '').trim().toLowerCase();
+          const durationMs = Number(clip.duration_ms || 0);
+          if (!itemId || !uploadUrl || !s3Key || !mimeType || !durationMs) {
+            throw new Error('Sentence audio upload data is incomplete.');
+          }
+          const binary = atob(String(clip.base64 || ''));
+          const bytes = new Uint8Array(binary.length);
+          for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+          const maxBytes = Number(upload.max_bytes || 4 * 1024 * 1024);
+          if (!bytes.byteLength || bytes.byteLength > maxBytes) {
+            throw new Error('Captured audio exceeds the 4 MiB upload limit.');
+          }
+          const form = new FormData();
+          Object.entries((upload.fields || {}) as Record<string, string>).forEach(([key, value]) => {
+            form.append(key, String(value));
+          });
+          form.set('Content-Type', mimeType);
+          form.append('file', new Blob([bytes], { type: mimeType }), 'sentence-audio');
+          const uploadResponse = await fetch(uploadUrl, { method: 'POST', body: form });
+          if (!uploadResponse.ok) {
+            throw new Error(`Sentence audio upload returned HTTP ${uploadResponse.status}.`);
+          }
+          const { response, text } = await authenticatedTier1Json(
+            `/learn-items/${encodeURIComponent(itemId)}/original-audio-ready`,
+            'POST',
+            { s3_key: s3Key, mime_type: mimeType, duration_ms: durationMs },
+          );
+          if (!response.ok) {
+            const normalized = normalizeLearnItemError(response.status, text);
+            throw new Error(normalized.message);
+          }
+          sendResponse({ success: true, data: { item_id: itemId, original_audio_status: 'queued' } });
+        } catch (err) {
+          sendResponse({ success: false, error: err instanceof Error ? err.message : String(err) });
+        }
+      })();
+      return true;
+    }
+
+    if (message.type === 'REFRESH_SENTENCE_AUDIO_UPLOAD') {
+      (async () => {
+        try {
+          const itemId = String(message.payload?.item_id || '').trim();
+          if (!itemId) throw new Error('Sentence item id is missing.');
+          const { response, text } = await authenticatedTier1Json(
+            `/learn-items/${encodeURIComponent(itemId)}/original-audio-upload`,
+            'POST',
+            {},
+          );
+          let data: Record<string, unknown> = {};
+          try { data = JSON.parse(text) as Record<string, unknown>; } catch { data = { error: text }; }
+          if (!response.ok) {
+            const normalized = normalizeLearnItemError(response.status, text);
+            throw new Error(normalized.message);
           }
           sendResponse({ success: true, data });
         } catch (err) {

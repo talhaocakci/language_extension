@@ -6,11 +6,13 @@ import {
   upsertCapturedSubtitle
 } from '../utils/subtitle-timing';
 import {
+  BROWSER_EXTENSION_PREFERENCES_STORAGE_KEY,
   DEFAULT_EXPLANATION_LANGUAGE,
   detectLanguageCode,
-  EXPLANATION_LANGUAGE_STORAGE_KEY,
+  getExplanationLanguageForTarget,
   getLanguageFlag,
   getLanguageLabel,
+  normalizeBrowserExtensionPreferences,
   normalizeLanguagePreference,
 } from '../utils/language-preferences';
 import {
@@ -23,7 +25,6 @@ import {
 } from '../experiments/netflix-audio/content-client';
 import {
   NETFLIX_AUDIO_MESSAGES,
-  type NetflixAudioClipMetadata,
 } from '../experiments/netflix-audio/protocol';
 
 let subtitleObserver: MutationObserver | null = null;
@@ -142,7 +143,7 @@ let overlayExplanationLanguage = DEFAULT_EXPLANATION_LANGUAGE;
 let overlayWordPopup: WordPopupState | null = null;
 let overlayWordLookupReqId = 0;
 
-type OverlaySentenceSaveState = 'idle' | 'preflight' | 'capture-required' | 'capturing' | 'saving' | 'saved' | 'error';
+type OverlaySentenceSaveState = 'idle' | 'preflight' | 'capture-required' | 'capturing' | 'saving' | 'saved' | 'audio-error' | 'error';
 let overlaySentenceSaveState: OverlaySentenceSaveState = 'idle';
 let overlaySentenceSaveMessage = '';
 let overlaySentenceSavedItemId = '';
@@ -919,11 +920,15 @@ async function callOverlayLLM(
 }
 
 async function lookupWordInContext(word: string, sentence: string): Promise<WordMeaning> {
-  const preferences = await chrome.runtime.sendMessage({ type: 'GET_LANGUAGE_PREFERENCES' });
+  const preferences = await chrome.runtime.sendMessage({
+    type: 'GET_LANGUAGE_PREFERENCES',
+    payload: { targetLanguage: getOverlayEffectiveTargetLanguage() },
+  });
   const explanationLanguage = normalizeLanguagePreference(
     preferences?.data?.explanationLanguage,
     DEFAULT_EXPLANATION_LANGUAGE,
   );
+  overlayExplanationLanguage = explanationLanguage;
   const targetLanguage = getOverlayEffectiveTargetLanguage() || 'auto-detect';
   const systemPrompt = `You are a multilingual language teacher. The learner clicked a token in a ${targetLanguage} sentence.
 Write all learner-facing explanations in ${explanationLanguage}. Use German-specific grammar fields only when the sentence is German; otherwise return null for fields that do not apply.
@@ -962,11 +967,15 @@ Always output valid JSON. No markdown, no extra keys.`;
 }
 
 async function analyseForPhrasalVerbs(sentence: string): Promise<SentenceAnalysis> {
-  const preferences = await chrome.runtime.sendMessage({ type: 'GET_LANGUAGE_PREFERENCES' });
+  const preferences = await chrome.runtime.sendMessage({
+    type: 'GET_LANGUAGE_PREFERENCES',
+    payload: { targetLanguage: getOverlayEffectiveTargetLanguage() },
+  });
   const explanationLanguage = normalizeLanguagePreference(
     preferences?.data?.explanationLanguage,
     DEFAULT_EXPLANATION_LANGUAGE,
   );
+  overlayExplanationLanguage = explanationLanguage;
   const resp = (await chrome.runtime.sendMessage({
     type: 'OVERLAY_EXPLAIN_SENTENCE',
     payload: {
@@ -1384,6 +1393,31 @@ interface SentencePreflightData {
   code?: string;
 }
 
+interface SentenceOriginalAudioUpload {
+  url: string;
+  fields: Record<string, string>;
+  s3_key: string;
+  expires_in_seconds?: number;
+  max_bytes?: number;
+}
+
+interface SentenceSaveData {
+  item_id?: string;
+  code?: string;
+  original_audio_status?: string;
+  original_audio_upload?: SentenceOriginalAudioUpload | null;
+  warnings?: unknown[];
+}
+
+interface PendingSentenceAudioEnrichment {
+  sentence: MeaningfulSentence;
+  sentenceKey: string;
+  itemId: string;
+  upload: SentenceOriginalAudioUpload;
+}
+
+let pendingSentenceAudioEnrichment: PendingSentenceAudioEnrichment | null = null;
+
 function sentenceSource(sentence: MeaningfulSentence): Record<string, unknown> {
   return {
     platform: activePlatform,
@@ -1393,6 +1427,85 @@ function sentenceSource(sentence: MeaningfulSentence): Record<string, unknown> {
     start_ms: Math.max(0, Math.round(sentence.startTime)),
     end_ms: Math.max(Math.round(sentence.startTime) + 1, Math.round(sentence.endTime)),
   };
+}
+
+async function enrichSavedSentenceOriginalAudio(
+  sentence: MeaningfulSentence,
+  sentenceKey: string,
+  itemId: string,
+  upload: SentenceOriginalAudioUpload,
+): Promise<void> {
+  try {
+    let clip = await findNetflixSentenceAudioClip(sentenceKey);
+    if (!clip) {
+      const video = getVideoElement();
+      if (!video) throw new Error('The streaming video element was not found.');
+      clip = await recordNetflixSentenceAudioClip(video, {
+        sentenceKey,
+        sentenceText: sentence.text,
+        sourceUrl: buildSourceUrl(sentence.startTime),
+        videoTitle: document.title,
+        startTimeMs: sentence.startTime,
+        endTimeMs: sentence.endTime,
+      });
+    }
+    const clipData = await getNetflixSentenceAudioClipData(clip.clipId);
+    const response = await chrome.runtime.sendMessage({
+      type: 'UPLOAD_SENTENCE_AUDIO',
+      payload: {
+        item_id: itemId,
+        upload,
+        clip: {
+          base64: clipData.base64Data,
+          mime_type: clipData.mimeType,
+          duration_ms: clipData.durationMs,
+        },
+      },
+    }) as MessageResponse<Record<string, unknown>>;
+    if (!response?.success) throw new Error(response?.error || 'Could not queue the original audio.');
+    await deleteNetflixSentenceAudioClip(clip.clipId).catch(() => undefined);
+    pendingSentenceAudioEnrichment = null;
+    if (overlaySentenceSavedItemId === itemId) {
+      overlaySentenceSaveState = 'saved';
+      overlaySentenceSaveMessage = 'Saved to From Web → Sentences. Original audio is processing.';
+      renderExplainPanel();
+    }
+  } catch (error) {
+    if (overlaySentenceSavedItemId === itemId) {
+      overlaySentenceSaveState = 'audio-error';
+      overlaySentenceSaveMessage = `Sentence saved. Original audio will need a retry: ${error instanceof Error ? error.message : String(error)}`;
+      renderExplainPanel();
+    }
+  }
+}
+
+async function retrySavedSentenceOriginalAudio(): Promise<void> {
+  const pending = pendingSentenceAudioEnrichment;
+  if (!pending) return;
+  overlaySentenceSaveState = 'capturing';
+  overlaySentenceSaveMessage = 'Sentence is already saved. Retrying original audio…';
+  renderExplainPanel();
+  try {
+    const refreshed = await chrome.runtime.sendMessage({
+      type: 'REFRESH_SENTENCE_AUDIO_UPLOAD',
+      payload: { item_id: pending.itemId },
+    }) as MessageResponse<SentenceSaveData>;
+    const upload = refreshed?.data?.original_audio_upload || null;
+    if (!refreshed?.success || !upload) {
+      throw new Error(refreshed?.error || 'Could not prepare a new audio upload.');
+    }
+    pending.upload = upload;
+    await enrichSavedSentenceOriginalAudio(
+      pending.sentence,
+      pending.sentenceKey,
+      pending.itemId,
+      upload,
+    );
+  } catch (error) {
+    overlaySentenceSaveState = 'audio-error';
+    overlaySentenceSaveMessage = `Sentence saved. Original audio retry failed: ${error instanceof Error ? error.message : String(error)}`;
+    renderExplainPanel();
+  }
 }
 
 async function saveExplainedSentence(): Promise<void> {
@@ -1408,8 +1521,6 @@ async function saveExplainedSentence(): Promise<void> {
     target_language: targetLanguage,
     source: sentenceSource(sentence),
   };
-  let retryClip: NetflixAudioClipMetadata | null = null;
-
   try {
     overlaySentenceSaveState = 'preflight';
     overlaySentenceSaveMessage = 'Checking your Learn List…';
@@ -1440,32 +1551,11 @@ async function saveExplainedSentence(): Promise<void> {
         await chrome.runtime.sendMessage({ type: 'OPEN_SENTENCE_AUDIO_SETUP' }).catch(() => undefined);
         return;
       }
-      retryClip = await findNetflixSentenceAudioClip(sentenceKey);
-      if (!retryClip) {
-        const video = getVideoElement();
-        if (!video) throw new Error('The streaming video element was not found.');
-        overlaySentenceSaveState = 'capturing';
-        overlaySentenceSaveMessage = 'Replaying this subtitle at 1× and capturing its audio…';
-        renderExplainPanel();
-        retryClip = await recordNetflixSentenceAudioClip(video, {
-          sentenceKey,
-          sentenceText: sentence.text,
-          sourceUrl: buildSourceUrl(sentence.startTime),
-          videoTitle: document.title,
-          startTimeMs: sentence.startTime,
-          endTimeMs: sentence.endTime,
-        });
-      }
     }
 
     overlaySentenceSaveState = 'saving';
-    overlaySentenceSaveMessage = 'Saving sentence, explanation and audio…';
+    overlaySentenceSaveMessage = 'Saving sentence and explanation…';
     renderExplainPanel();
-    const clipData = retryClip ? await getNetflixSentenceAudioClipData(retryClip.clipId) : null;
-    const maxBytes = Number(preflight.data?.max_audio_bytes || 4 * 1024 * 1024);
-    if (clipData && clipData.byteLength > maxBytes) {
-      throw new Error('Captured audio exceeds the 4 MiB upload limit.');
-    }
     const saveResponse = await chrome.runtime.sendMessage({
       type: 'SAVE_SENTENCE',
       payload: {
@@ -1474,13 +1564,8 @@ async function saveExplainedSentence(): Promise<void> {
         explanation_language: overlayExplanationLanguage,
         sentence_explanation: analysis,
         client_request_id: crypto.randomUUID(),
-        captured_audio: clipData ? {
-          base64: clipData.base64Data,
-          mime_type: clipData.mimeType,
-          duration_ms: clipData.durationMs,
-        } : null,
       },
-    }) as MessageResponse<Record<string, unknown>>;
+    }) as MessageResponse<SentenceSaveData>;
     if (!saveResponse?.success) {
       if (saveResponse?.data?.code === 'SENTENCE_ALREADY_SAVED') {
         overlaySentenceSaveState = 'saved';
@@ -1490,15 +1575,26 @@ async function saveExplainedSentence(): Promise<void> {
       }
       throw new Error(saveResponse?.error || 'Could not save this sentence.');
     }
-    if (retryClip) await deleteNetflixSentenceAudioClip(retryClip.clipId).catch(() => undefined);
     overlaySentenceSavedItemId = String(saveResponse.data?.item_id || '');
-    const warnings = Array.isArray(saveResponse.data?.warnings)
-      ? (saveResponse.data?.warnings as unknown[]).map(String)
-      : [];
     overlaySentenceSaveState = 'saved';
-    overlaySentenceSaveMessage = warnings.length > 0
-      ? 'Saved. One audio version could not be created; playback fallback will be used.'
-      : 'Saved to From Web → Sentences.';
+    const originalUpload = saveResponse.data?.original_audio_upload || null;
+    if (originalEnabled && originalUpload && overlaySentenceSavedItemId) {
+      pendingSentenceAudioEnrichment = {
+        sentence,
+        sentenceKey,
+        itemId: overlaySentenceSavedItemId,
+        upload: originalUpload,
+      };
+      overlaySentenceSaveMessage = 'Saved. Adding original audio in the background…';
+      void enrichSavedSentenceOriginalAudio(
+        sentence,
+        sentenceKey,
+        overlaySentenceSavedItemId,
+        originalUpload,
+      );
+    } else {
+      overlaySentenceSaveMessage = 'Saved to From Web → Sentences. Audio is processing.';
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (isAuthRequiredError(message)) void openExtensionPopupFromOverlay();
@@ -1688,7 +1784,10 @@ function ensureOnVideoSentenceOverlay(): HTMLDivElement {
   document.body.appendChild(overlay);
 
   renderOverlayTargetLanguageControl();
-  void chrome.runtime.sendMessage({ type: 'GET_LANGUAGE_PREFERENCES' }).then((response) => {
+  void chrome.runtime.sendMessage({
+    type: 'GET_LANGUAGE_PREFERENCES',
+    payload: { targetLanguage: getOverlayEffectiveTargetLanguage() },
+  }).then((response) => {
     overlayExplanationLanguage = normalizeLanguagePreference(
       response?.data?.explanationLanguage,
       DEFAULT_EXPLANATION_LANGUAGE,
@@ -2454,6 +2553,8 @@ function renderExplainPanel(): void {
   sentenceSaveButton.disabled = busy || overlaySentenceSaveState === 'saved';
   sentenceSaveButton.textContent = overlaySentenceSaveState === 'saved'
     ? '✓ Sentence saved'
+    : overlaySentenceSaveState === 'audio-error'
+      ? 'Retry original audio'
     : overlaySentenceSaveState === 'capture-required'
       ? 'Enable audio capture'
       : busy
@@ -2475,13 +2576,17 @@ function renderExplainPanel(): void {
       void chrome.runtime.sendMessage({ type: 'OPEN_SENTENCE_AUDIO_SETUP' });
       return;
     }
+    if (overlaySentenceSaveState === 'audio-error') {
+      void retrySavedSentenceOriginalAudio();
+      return;
+    }
     void saveExplainedSentence();
   });
   sentenceSaveWrap.appendChild(sentenceSaveButton);
   if (overlaySentenceSaveMessage) {
     const status = document.createElement('span');
     status.textContent = overlaySentenceSaveMessage;
-    status.style.cssText = `font-size:11px;color:${overlaySentenceSaveState === 'error' ? '#ffb6b6' : '#c8d7ff'};`;
+    status.style.cssText = `font-size:11px;color:${overlaySentenceSaveState === 'error' || overlaySentenceSaveState === 'audio-error' ? '#ffb6b6' : '#c8d7ff'};`;
     status.title = overlaySentenceSavedItemId ? `Learn item ${overlaySentenceSavedItemId}` : '';
     sentenceSaveWrap.appendChild(status);
   }
@@ -2987,10 +3092,12 @@ chrome.runtime.onMessage.addListener((message: MessageRequest, sender, sendRespo
 });
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
-  if (areaName !== 'sync' || !changes[EXPLANATION_LANGUAGE_STORAGE_KEY]) return;
-  overlayExplanationLanguage = normalizeLanguagePreference(
-    changes[EXPLANATION_LANGUAGE_STORAGE_KEY].newValue,
-    DEFAULT_EXPLANATION_LANGUAGE,
+  if (areaName !== 'sync' || !changes[BROWSER_EXTENSION_PREFERENCES_STORAGE_KEY]) return;
+  overlayExplanationLanguage = getExplanationLanguageForTarget(
+    normalizeBrowserExtensionPreferences(
+      changes[BROWSER_EXTENSION_PREFERENCES_STORAGE_KEY].newValue,
+    ),
+    getOverlayEffectiveTargetLanguage(),
   );
   for (const key of Object.keys(sentenceAnalysisCache)) delete sentenceAnalysisCache[key];
   for (const key of Object.keys(wordMeaningCache)) delete wordMeaningCache[key];

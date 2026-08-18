@@ -29,6 +29,8 @@
     "https://*.hbomax.com/*",
     "https://auth.getfluentfast.app/*",
     "https://api.getfluentfast.app/*",
+    "https://getfluentfast-media.s3.amazonaws.com/*",
+    "https://getfluentfast-media.s3.eu-central-1.amazonaws.com/*",
     "https://6b9x4wcwjh.execute-api.eu-central-1.amazonaws.com/*"
   ],
   "background": {
