@@ -15,7 +15,7 @@ When enabled, the extension suppresses the platform subtitle renderer and places
 ## Backend contracts
 
 - Authentication: `https://auth.getfluentfast.app`, using the dedicated browser-extension Cognito client.
-- LLM analysis: `POST /prod/analyze` and `POST /prod/explain` on the retained extension API Gateway.
+- LLM analysis: `POST /prod/analyze` and `POST /prod/explain` on `https://api.getfluentfast.app`, hosted by the same compact API as vocabulary and quiz evaluation.
 - Vocabulary: `https://api.getfluentfast.app/learn-items` with an explicit `target_language`.
 - Quiz evaluation: `https://api.getfluentfast.app/quiz/evaluate`.
 
@@ -36,4 +36,4 @@ Load the generated `dist/` directory as an unpacked extension in Chrome.
 
 ## Permissions
 
-Host access is limited to the supported streaming sites, GetFluentFast authentication and API hosts, and the retained API Gateway. The manifest does not request broad `https://*/*` access.
+Host access is limited to the supported streaming sites, GetFluentFast authentication and API hosts. The manifest does not request broad `https://*/*` access.

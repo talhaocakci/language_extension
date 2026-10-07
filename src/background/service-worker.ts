@@ -21,7 +21,7 @@ import { isNetflixOrMaxUrl } from '../experiments/netflix-audio/protocol';
 console.log('Service Worker starting...');
 
 // ── Backend & auth configuration ─────────────────────────────────────────────
-const API_BASE_URL      = 'https://6b9x4wcwjh.execute-api.eu-central-1.amazonaws.com/prod';
+const API_BASE_URL      = 'https://api.getfluentfast.app/prod';
 const ANALYZE_URL = `${API_BASE_URL}/analyze`;
 // language_backend tier1 public endpoint (non-API-Gateway)
 const LANGUAGE_TIER1_BASE_URL = 'https://api.getfluentfast.app';
