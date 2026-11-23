@@ -25,7 +25,7 @@ function endsSentence(text: string): boolean {
   if (!core || !SENTENCE_MARKS.has(core[core.length - 1])) return false;
   if (core[core.length - 1] !== '.') return true;
   if (/^\p{Lu}\.$/u.test(core) && core !== 'I.') return false;
-  if (/^\d+\.$/.test(core)) return false;
+  if (/^\d{1,2}\.$/.test(core)) return false;
   return !ABBREVIATIONS.has(core.slice(0, -1).toLowerCase());
 }
 
@@ -107,7 +107,7 @@ export function sentencesFromTimedWords(words: TimedWord[], trackKey: string): M
   let run: TimedWord[] = [];
 
   const flush = () => {
-    while (run.length > 0 && !withinLimits(run, 0, run.length - 1)) {
+    while (run.length > 1 && !withinLimits(run, 0, run.length - 1)) {
       const cut = splitIndex(run);
       sentences.push(toSentence(run.slice(0, cut + 1), trackKey));
       run = run.slice(cut + 1);

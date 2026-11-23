@@ -87,3 +87,23 @@ test('player track state round-trips and rejects junk', () => {
     playerTrackKey({ ...state, tlang: '' })
   );
 });
+
+test('a request that already is the player track is used unchanged even when a newer one is not', () => {
+  const exact = `${original}&name=Deutsch`;
+  const newer = `${base}?v=abc&lang=en&fmt=json3&pot=TOKEN2`;
+  assert.equal(pickTimedtextUrl([exact, newer], 'abc', { lang: 'de', kind: '', tlang: '' }), exact);
+});
+
+test('re-pointing a request at another track drops its track name', () => {
+  const picked = pickTimedtextUrl([`${translated}&name=Turkish`], 'abc', { lang: 'en', kind: 'asr', tlang: '' });
+  const params = new URL(picked || '').searchParams;
+  assert.equal(params.get('lang'), 'en');
+  assert.equal(params.get('name'), null);
+});
+
+test('requests from other hosts or over plain http are ignored', () => {
+  const evil = 'https://evil.example/api/timedtext?v=abc&lang=de&pot=T';
+  const plain = 'http://www.youtube.com/api/timedtext?v=abc&lang=de&pot=T';
+  assert.equal(pickTimedtextUrl([evil, plain], 'abc'), null);
+  assert.equal(pickTimedtextUrl([evil, plain], 'abc', { lang: 'de', kind: '', tlang: '' }), null);
+});

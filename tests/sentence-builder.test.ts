@@ -100,3 +100,50 @@ test('sentence ids are stable for the same sentence and differ across tracks', (
   assert.match(a[0].id, /^yt-[0-9a-f]{8}$/);
   assert.equal(a[0].id, sentenceId('vid|en||', 0, 'Hello there.'));
 });
+
+function timed(entries: Array<[string, number]>, startMs = 0): TimedWord[] {
+  let t = startMs;
+  return entries.map(([text, ms]) => {
+    const word = { text, startMs: t, endMs: t + ms };
+    t += ms;
+    return word;
+  });
+}
+
+test('a single word longer than the time limit at the end of a track is kept as it is', () => {
+  const ws = [...words('Hello there. Thanks for watching.'), ...timed([['♪', 20_000]], 1500)];
+  let out: string[] = [];
+  assert.doesNotThrow(() => {
+    out = texts(ws);
+  });
+  assert.equal(out[out.length - 1], '♪');
+});
+
+test('a one-word sentence longer than the time limit is its own sentence', () => {
+  const ws = timed([
+    ['See', 300], ['you', 300], ['soon.', 300],
+    ['Bye!', 16_000],
+    ['Next', 300], ['time', 300], ['then.', 300]
+  ]);
+  let out: string[] = [];
+  assert.doesNotThrow(() => {
+    out = texts(ws);
+  });
+  assert.deepEqual(out, ['See you soon.', 'Bye!', 'Next time then.']);
+});
+
+test('an over-long sentence with no commas is split at the largest silent gap within the limit', () => {
+  const ws: TimedWord[] = Array.from({ length: 20 }, (_, i) => {
+    const start = i * 1000 + (i >= 8 ? 3000 : 0);
+    return { text: i === 19 ? `w${i}.` : `w${i}`, startMs: start, endMs: start + 1000 };
+  });
+  const sentences = sentencesFromTimedWords(ws, 'vid|en||')!;
+  assert.ok(sentences.length > 1);
+  assert.ok(sentences[0].text.endsWith('w7'));
+  assert.equal(sentences[0].subPortions.length, 8);
+  assert.ok(sentences.every((s) => s.endTime - s.startTime <= 15_000));
+});
+
+test('a year followed by a full stop ends a sentence', () => {
+  assert.deepEqual(texts(words('It happened in 2020. Then we left.')), ['It happened in 2020.', 'Then we left.']);
+});

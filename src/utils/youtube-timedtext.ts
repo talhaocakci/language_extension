@@ -67,10 +67,24 @@ function setOrDelete(params: URLSearchParams, name: string, value: string): void
   else params.delete(name);
 }
 
+function isYoutubeHttps(url: URL): boolean {
+  return url.protocol === 'https:' && (url.hostname === 'www.youtube.com' || url.hostname.endsWith('.youtube.com'));
+}
+
+function isTrack(params: URLSearchParams, track: TimedtextTrack): boolean {
+  return (
+    params.get('lang') === track.lang &&
+    (params.get('kind') === 'asr') === (track.kind === 'asr') &&
+    (params.get('tlang') || '') === (track.tlang || '')
+  );
+}
+
 /**
  * `urls` is in request order, oldest first. With `track`, the result is the
- * URL for exactly that track: one player token serves every track of a video,
- * so any tokened request for the video can be re-pointed at it.
+ * URL for exactly that track: the newest request already for that track is
+ * used as it is; otherwise, since one player token serves every track of a
+ * video, the newest tokened request is re-pointed at it. Only https URLs on
+ * youtube.com hosts are accepted.
  */
 export function pickTimedtextUrl(
   urls: string[],
@@ -79,14 +93,16 @@ export function pickTimedtextUrl(
 ): string | null {
   let best: string | null = null;
   let bestRank = -1;
+  let exact: string | null = null;
 
   for (const url of urls) {
     const parsed = parse(url);
-    if (!parsed || !parsed.pathname.endsWith(TIMEDTEXT_PATH)) continue;
+    if (!parsed || !isYoutubeHttps(parsed) || !parsed.pathname.endsWith(TIMEDTEXT_PATH)) continue;
     const params = parsed.searchParams;
     if (videoId && params.get('v') !== videoId) continue;
     if (!params.get('pot')) continue;
 
+    if (track?.lang && isTrack(params, track)) exact = url;
     const candidateRank = track?.lang ? 0 : rank(params);
     if (candidateRank >= bestRank) {
       best = url;
@@ -95,11 +111,13 @@ export function pickTimedtextUrl(
   }
 
   if (!best || !track?.lang) return best;
+  if (exact) return exact;
 
   const pointed = new URL(best);
   pointed.searchParams.set('lang', track.lang);
   setOrDelete(pointed.searchParams, 'kind', track.kind);
   setOrDelete(pointed.searchParams, 'tlang', track.tlang);
+  pointed.searchParams.delete('name');
   return pointed.toString();
 }
 
