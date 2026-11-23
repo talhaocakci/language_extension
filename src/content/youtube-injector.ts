@@ -1,6 +1,7 @@
 import type { SubtitleChunk, MeaningfulSentence } from '../types/subtitle';
 import type { MessageRequest, MessageResponse, PlaybackControlPayload } from '../types/common';
-import { buildYouTubeSentences } from '../utils/youtube-sentences';
+import { groupAndProcessSubtitles } from '../utils/subtitle-processor';
+import { shapeYouTubeSentences } from '../utils/youtube-sentences';
 import {
   CAPTIONS_ON_EVENT,
   PLAYER_TRACK_ATTRIBUTE,
@@ -28,6 +29,8 @@ let captionsRetryTimer: number | null = null;
 let lastSubtitles: SubtitleChunk[] = [];
 // Raw caption response the current cues were parsed from; '' when unknown.
 let lastRawCaptionText = '';
+// Shaped sentences for the current captions; null when the heuristic grouping is used.
+let shapedSentences: MeaningfulSentence[] | null = null;
 let allExtractedSubtitles: SubtitleChunk[] = [];
 let meaningfulSentences: MeaningfulSentence[] = [];
 let captionsExtracted = false;
@@ -129,6 +132,7 @@ function resetTranscriptState(): void {
   captionsCacheVideoId = '';
   lastSubtitles = [];
   lastRawCaptionText = '';
+  shapedSentences = null;
   allExtractedSubtitles = [];
   activeCaptionLanguageCode = '';
   captionTrackKeyInUse = '';
@@ -2520,7 +2524,8 @@ async function ensureCaptionsForCurrentVideo(force = false): Promise<void> {
       return;
     }
 
-    meaningfulSentences = buildYouTubeSentences(lastRawCaptionText, captions, captionTrackKeyInUse || currentVideoId);
+    shapedSentences = shapeYouTubeSentences(lastRawCaptionText, captions, captionTrackKeyInUse || currentVideoId);
+    meaningfulSentences = shapedSentences ?? groupAndProcessSubtitles(captions);
     lastSubtitles = captions;
     captionsExtracted = true;
     captionsCacheVideoId = requestedVideoId;
@@ -2631,7 +2636,7 @@ chrome.runtime.onMessage.addListener((message: MessageRequest, sender, sendRespo
           success: true,
           data: {
             meaningfulSentences: meaningfulSentences,
-            sentences: meaningfulSentences,
+            ...(shapedSentences ? { sentences: shapedSentences } : {}),
             subtitles: lastSubtitles,
             videoId: currentVideoId,
             captionLanguageCode: activeCaptionLanguageCode,
@@ -2694,7 +2699,8 @@ chrome.runtime.onMessage.addListener((message: MessageRequest, sender, sendRespo
             } as MessageResponse);
             return;
           }
-          meaningfulSentences = buildYouTubeSentences(lastRawCaptionText, captions, captionTrackKeyInUse || currentVideoId);
+          shapedSentences = shapeYouTubeSentences(lastRawCaptionText, captions, captionTrackKeyInUse || currentVideoId);
+          meaningfulSentences = shapedSentences ?? groupAndProcessSubtitles(captions);
           lastSubtitles = captions;
           captionsExtracted = true;
           captionsCacheVideoId = requestedVideoId;
@@ -2705,7 +2711,7 @@ chrome.runtime.onMessage.addListener((message: MessageRequest, sender, sendRespo
             success: true,
             data: {
               meaningfulSentences: meaningfulSentences,
-              sentences: meaningfulSentences,
+              ...(shapedSentences ? { sentences: shapedSentences } : {}),
               subtitles: captions,
               videoId: currentVideoId,
               captionLanguageCode: activeCaptionLanguageCode,

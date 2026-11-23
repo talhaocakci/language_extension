@@ -4,6 +4,22 @@ import { groupAndProcessSubtitles } from './subtitle-processor';
 import { timedWordsFromCaptionText, timedWordsFromCues } from './timed-words';
 
 /**
+ * Shaped sentences for a YouTube caption response, or null when the track
+ * stays on the heuristic grouping.
+ */
+export function shapeYouTubeSentences(
+  rawCaptionText: string,
+  cues: SubtitleChunk[],
+  trackKey: string
+): MeaningfulSentence[] | null {
+  let words = timedWordsFromCaptionText(rawCaptionText);
+  if (words.length === 0) {
+    words = timedWordsFromCues(cues);
+  }
+  return sentencesFromTimedWords(words, trackKey);
+}
+
+/**
  * Sentences for a YouTube caption response: shaped sentences when the track is
  * punctuated, otherwise exactly groupAndProcessSubtitles(cues).
  */
@@ -12,9 +28,5 @@ export function buildYouTubeSentences(
   cues: SubtitleChunk[],
   trackKey: string
 ): MeaningfulSentence[] {
-  let words = timedWordsFromCaptionText(rawCaptionText);
-  if (words.length === 0) {
-    words = timedWordsFromCues(cues);
-  }
-  return sentencesFromTimedWords(words, trackKey) ?? groupAndProcessSubtitles(cues);
+  return shapeYouTubeSentences(rawCaptionText, cues, trackKey) ?? groupAndProcessSubtitles(cues);
 }

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildYouTubeSentences } from '../src/utils/youtube-sentences';
+import { buildYouTubeSentences, shapeYouTubeSentences } from '../src/utils/youtube-sentences';
 import { groupAndProcessSubtitles } from '../src/utils/subtitle-processor';
 
 const cues = [
@@ -29,4 +29,18 @@ test('an unpunctuated track gets exactly the heuristic text', () => {
 
 test('no cues and no words yield no sentences', () => {
   assert.deepEqual(buildYouTubeSentences('', [], 'vid|en||'), []);
+});
+
+test('shapeYouTubeSentences returns null for an unpunctuated track', () => {
+  const plain = Array.from({ length: 60 }, (_, i) => ({ text: `caption fragment number ${i}`, startTime: i * 2500, endTime: (i + 1) * 2500 }));
+  const plainJson3 = JSON.stringify({
+    events: plain.map((c) => ({ tStartMs: c.startTime, dDurationMs: c.endTime - c.startTime, segs: [{ utf8: c.text }] }))
+  });
+  assert.equal(shapeYouTubeSentences('', plain, 'vid|en|asr|'), null);
+  assert.equal(shapeYouTubeSentences(plainJson3, plain, 'vid|en|asr|'), null);
+});
+
+test('shapeYouTubeSentences returns the shaped sentences for a punctuated track', () => {
+  const out = shapeYouTubeSentences(json3, cues, 'vid|en|asr|');
+  assert.deepEqual(out?.map((s) => s.text), ['You know the rules and so do I.', 'I feel fine.']);
 });
