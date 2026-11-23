@@ -5,7 +5,7 @@
 // called with the original arguments, after the capture code and outside its
 // try/catch, and its return value is passed back untouched.
 
-import { WINDOW_EDGE_TOLERANCE_MS, WINDOW_MS, readyWindows } from '../utils/transcription-windows';
+import { readyWindows } from '../utils/transcription-windows';
 import type { ReadyWindow } from '../utils/transcription-windows';
 import { buildWindowFile, parseWebmAudio } from '../utils/webm-audio';
 
@@ -21,18 +21,22 @@ export interface AudioCapture {
   format(): AudioFormat;
   /** Timecode of the newest kept cluster, or null when none is kept. */
   lastClusterMs(): number | null;
-  /** Drop every kept byte (the format stays); called when the video has captions. */
+  /** Drop kept clusters and unfinished bytes; the init part of the current buffer and the format stay. */
   reset(): void;
   /** While disabled nothing is kept. A new audio buffer keeps the current flag. */
   setEnabled(enabled: boolean): void;
 }
 
+export type CaptureWrapperName = 'addSourceBuffer' | 'appendBuffer' | 'abort' | 'changeType';
+
 export interface AudioCaptureOptions {
-  /** Tests only: makes the internal store throw so the wrappers' safety can be checked. */
-  breakCapture?: boolean;
+  /** Tests only: makes the capture code of the named wrappers throw so their safety can be checked. */
+  breakCapture?: Partial<Record<CaptureWrapperName, boolean>>;
 }
 
+const INSTALLED_MARK = '__gffAudioCapture';
 const EBML_ID = [0x1a, 0x45, 0xdf, 0xa3];
+const CLUSTER_ID = [0x1f, 0x43, 0xb6, 0x75];
 
 function startsWithEbml(bytes: Uint8Array): boolean {
   return bytes.length >= 4 && EBML_ID.every((b, i) => bytes[i] === b);
@@ -45,8 +49,12 @@ function concat(a: Uint8Array, b: Uint8Array): Uint8Array {
   return out;
 }
 
-function windowOf(timecodeMs: number): number {
-  return Math.floor((timecodeMs + WINDOW_EDGE_TOLERANCE_MS) / WINDOW_MS);
+/** Cuts `bytes` to its first Cluster id; without one only a possibly split id (3 bytes) is kept. */
+function fromFirstCluster(bytes: Uint8Array): Uint8Array {
+  for (let i = 0; i + 4 <= bytes.length; i++) {
+    if (CLUSTER_ID.every((b, k) => bytes[i + k] === b)) return i === 0 ? bytes : bytes.slice(i);
+  }
+  return bytes.slice(Math.max(0, bytes.length - 3));
 }
 
 function copyBytes(data: unknown): Uint8Array | null {
@@ -66,15 +74,27 @@ class AudioStore {
   private keptBytes = 0;
   /** Bytes received since the last complete cluster (or the init part being received). */
   private pending: Uint8Array = new Uint8Array(0);
-  /** Windows that lost a cluster to the size limit. */
-  private lostWindows = new Set<number>();
+  private enabled = true;
 
-  reset(): void {
+  /** A new audio buffer: forget everything, including the init part, and keep again. */
+  startOver(): void {
     this.init = null;
+    this.enabled = true;
+    this.pending = new Uint8Array(0);
+    this.reset();
+  }
+
+  /** Forget clusters and unfinished bytes; the init part of the current buffer stays. */
+  reset(): void {
     this.clusters = [];
     this.keptBytes = 0;
-    this.pending = new Uint8Array(0);
-    this.lostWindows = new Set();
+    // An init part that is still arriving belongs to the current buffer and stays.
+    if (!startsWithEbml(this.pending)) this.pending = new Uint8Array(0);
+  }
+
+  setEnabled(enabled: boolean): void {
+    this.enabled = enabled;
+    if (!enabled) this.reset();
   }
 
   abort(): void {
@@ -95,11 +115,14 @@ class AudioStore {
       this.init = this.pending.slice(0, head.initLength);
       this.pending = this.pending.slice(head.initLength);
     }
-    if (!this.init) {
+    if (!this.init || !this.enabled) {
       this.pending = new Uint8Array(0);
       return;
     }
-    if (this.pending.length === 0) return;
+
+    // A retried or seeked-into chunk may start mid-cluster: resume at the next cluster id.
+    this.pending = fromFirstCluster(this.pending);
+    if (this.pending.length < 4) return;
 
     // Only the not-yet-consumed tail is parsed; the init part makes it a valid stream.
     const combined = concat(this.init, this.pending);
@@ -126,14 +149,13 @@ class AudioStore {
     let drop = 0;
     while (this.keptBytes > MAX_KEPT_BYTES && drop < this.clusters.length) {
       this.keptBytes -= this.clusters[drop].bytes.length;
-      this.lostWindows.add(windowOf(this.clusters[drop].timecodeMs));
       drop++;
     }
     if (drop > 0) this.clusters.splice(0, drop);
   }
 
   windows(videoEndMs?: number): ReadyWindow[] {
-    return readyWindows(this.clusters, videoEndMs).filter((w) => !this.lostWindows.has(w.index));
+    return readyWindows(this.clusters, videoEndMs);
   }
 
   windowFile(index: number, videoEndMs?: number): Uint8Array | null {
@@ -151,27 +173,33 @@ class AudioStore {
   }
 }
 
-/** Wraps addSourceBuffer / appendBuffer / abort on the given prototypes. */
+/** Wraps addSourceBuffer / appendBuffer / abort / changeType on the given prototypes (once per prototype). */
 export function installAudioCapture(
   mediaSourceProto: any,
   sourceBufferProto: any,
   options: AudioCaptureOptions = {}
 ): AudioCapture {
+  const existing = sourceBufferProto?.[INSTALLED_MARK] ?? mediaSourceProto?.[INSTALLED_MARK];
+  if (existing) return existing as AudioCapture;
+
   const store = new AudioStore();
   let format: AudioFormat = '';
-  let enabled = true;
   let audioBuffer: unknown = null;
   let keepAudio = false;
+  const broken = (name: CaptureWrapperName): void => {
+    if (options.breakCapture?.[name]) throw new Error(`capture broken in ${name}`);
+  };
 
   const originalAdd = mediaSourceProto?.addSourceBuffer;
   if (typeof originalAdd === 'function') {
     mediaSourceProto.addSourceBuffer = function (this: unknown, ...args: any[]) {
       const buffer = originalAdd.apply(this, args);
       try {
+        broken('addSourceBuffer');
         const mime = String(args[0] ?? '').trim().toLowerCase();
         if (mime.startsWith('audio/')) {
           audioBuffer = buffer;
-          store.reset();
+          store.startOver();
           keepAudio = mime.startsWith('audio/webm');
           format = keepAudio ? 'webm-opus' : 'unsupported';
         }
@@ -185,16 +213,21 @@ export function installAudioCapture(
   const originalAppend = sourceBufferProto?.appendBuffer;
   if (typeof originalAppend === 'function') {
     sourceBufferProto.appendBuffer = function (this: unknown, ...args: any[]) {
+      let bytes: Uint8Array | null = null;
       try {
-        if (this === audioBuffer && keepAudio && enabled) {
-          if (options.breakCapture) throw new Error('capture broken');
-          const bytes = copyBytes(args[0]);
-          if (bytes) store.append(bytes);
-        }
+        if (this === audioBuffer && keepAudio) bytes = copyBytes(args[0]);
       } catch {
         // Capture problems must never reach the player.
       }
-      return originalAppend.apply(this, args);
+      // If the original throws, nothing was appended and nothing is kept.
+      const result = originalAppend.apply(this, args);
+      try {
+        broken('appendBuffer');
+        if (bytes) store.append(bytes);
+      } catch {
+        // Capture problems must never reach the player.
+      }
+      return result;
     };
   }
 
@@ -202,6 +235,7 @@ export function installAudioCapture(
   if (typeof originalAbort === 'function') {
     sourceBufferProto.abort = function (this: unknown, ...args: any[]) {
       try {
+        broken('abort');
         if (this === audioBuffer) store.abort();
       } catch {
         // Capture problems must never reach the player.
@@ -210,15 +244,36 @@ export function installAudioCapture(
     };
   }
 
-  return {
+  const originalChangeType = sourceBufferProto?.changeType;
+  if (typeof originalChangeType === 'function') {
+    sourceBufferProto.changeType = function (this: unknown, ...args: any[]) {
+      const result = originalChangeType.apply(this, args);
+      try {
+        broken('changeType');
+        if (this === audioBuffer) {
+          const mime = String(args[0] ?? '').trim().toLowerCase();
+          keepAudio = mime.startsWith('audio/webm');
+          format = keepAudio ? 'webm-opus' : 'unsupported';
+          if (keepAudio) store.abort();
+          else store.reset();
+        }
+      } catch {
+        // Capture problems must never reach the player.
+      }
+      return result;
+    };
+  }
+
+  const capture: AudioCapture = {
     windows: (videoEndMs) => store.windows(videoEndMs),
     windowFile: (index, videoEndMs) => store.windowFile(index, videoEndMs),
     format: () => format,
     lastClusterMs: () => store.lastClusterMs(),
     reset: () => store.reset(),
-    setEnabled(value) {
-      enabled = value;
-      if (!value) store.reset();
-    },
+    setEnabled: (value) => store.setEnabled(value),
   };
+  for (const proto of [mediaSourceProto, sourceBufferProto]) {
+    if (proto) Object.defineProperty(proto, INSTALLED_MARK, { value: capture, enumerable: false });
+  }
+  return capture;
 }

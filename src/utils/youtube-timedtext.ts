@@ -130,8 +130,20 @@ export function getTimedtextLanguage(url: string): string {
 // which audio windows it holds on this attribute and answers a request for one
 // window's file with a window message; the audio never goes anywhere else.
 export const AUDIO_STATE_ATTRIBUTE = 'data-gff-audio-state';
-export const AUDIO_WINDOW_REQUEST_EVENT = 'gff-audio-window-request'; // detail: JSON string { requestId, index }
+export const AUDIO_WINDOW_REQUEST_EVENT = 'gff-audio-window-request'; // detail: JSON string { requestId, index, videoId? }
 export const AUDIO_WINDOW_MESSAGE = 'gff-audio-window'; // window.postMessage type
+
+/** window.postMessage payload answering a window request; file is null when the window is unavailable. */
+export interface AudioWindowMessage {
+  type: typeof AUDIO_WINDOW_MESSAGE;
+  requestId: string;
+  index: number;
+  /** The player's current video id when the answer was made. */
+  videoId: string;
+  startMs: number;
+  partial: boolean;
+  file: ArrayBuffer | null;
+}
 
 export interface AudioCaptureState {
   videoId: string;

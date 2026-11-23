@@ -11,7 +11,7 @@ import {
   CAPTIONS_ON_EVENT,
   PLAYER_TRACK_ATTRIBUTE,
 } from '../utils/youtube-timedtext';
-import type { AudioCaptureState } from '../utils/youtube-timedtext';
+import type { AudioCaptureState, AudioWindowMessage } from '../utils/youtube-timedtext';
 import { installAudioCapture } from './youtube-audio-capture';
 
 const PUBLISH_INTERVAL_MS = 1000;
@@ -69,11 +69,26 @@ function videoEndMs(player: any): number | undefined {
   }
 }
 
+let lastAudioVideoId = '';
+
+function currentVideoId(player: any): string {
+  try {
+    const id = player?.getVideoData?.()?.video_id;
+    return typeof id === 'string' ? id : '';
+  } catch {
+    return '';
+  }
+}
+
 function readAudioState(): string {
   try {
     const player = getPlayer();
-    const videoId = player?.getVideoData?.()?.video_id;
+    const videoId = currentVideoId(player);
     if (!player || !videoId) return '';
+
+    // Audio kept for another video must never be published under this one.
+    if (lastAudioVideoId && lastAudioVideoId !== videoId) capture.reset();
+    lastAudioVideoId = videoId;
 
     const tracks = player.getPlayerResponse?.()?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
     const hasCaptions = Array.isArray(tracks) && tracks.length > 0;
@@ -113,22 +128,23 @@ document.addEventListener(AUDIO_WINDOW_REQUEST_EVENT, (event) => {
     const request = typeof detail === 'string' ? JSON.parse(detail) : null;
     if (!request || typeof request.requestId !== 'string' || !Number.isInteger(request.index)) return;
 
-    const endMs = videoEndMs(getPlayer());
-    const window_ = capture.windows(endMs).find((w) => w.index === request.index);
+    const player = getPlayer();
+    const videoId = currentVideoId(player);
+    const stale = typeof request.videoId === 'string' && request.videoId !== videoId;
+    const endMs = videoEndMs(player);
+    const window_ = stale ? undefined : capture.windows(endMs).find((w) => w.index === request.index);
     const bytes = window_ ? capture.windowFile(request.index, endMs) : null;
-    const file = bytes ? bytes.slice().buffer : null;
-    window.postMessage(
-      {
-        type: AUDIO_WINDOW_MESSAGE,
-        requestId: request.requestId,
-        index: request.index,
-        startMs: window_?.startMs ?? 0,
-        partial: window_?.partial ?? false,
-        file,
-      },
-      location.origin,
-      file ? [file] : []
-    );
+    const file = bytes ? (bytes.slice().buffer as ArrayBuffer) : null;
+    const message: AudioWindowMessage = {
+      type: AUDIO_WINDOW_MESSAGE,
+      requestId: request.requestId,
+      index: request.index,
+      videoId,
+      startMs: window_?.startMs ?? 0,
+      partial: window_?.partial ?? false,
+      file,
+    };
+    window.postMessage(message, location.origin, file ? [file] : []);
   } catch {
     // A malformed request is ignored.
   }
