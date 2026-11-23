@@ -17,6 +17,7 @@ import {
   stopNetflixAudioExperimentForTab,
 } from '../experiments/netflix-audio/background-controller';
 import { isNetflixOrMaxUrl } from '../experiments/netflix-audio/protocol';
+import { parseTranscribeResponse, parseWindowsResponse, shouldRetryTranscribe } from '../utils/transcript-api';
 import { getTimedtextLanguage, pickTimedtextUrl, type TimedtextTrack } from '../utils/youtube-timedtext';
 
 console.log('Service Worker starting...');
@@ -616,6 +617,86 @@ chrome.runtime.onMessage.addListener((message: MessageRequest, sender, sendRespo
         }
       });
       return;
+    }
+
+    if (message.type === 'TRANSCRIPT_WINDOWS') {
+      (async () => {
+        try {
+          const token = await getValidIdToken();
+          if (!token) {
+            sendResponse({ success: true, windows: [] });
+            return;
+          }
+          const videoId = message.payload?.videoId ?? (message as any).videoId;
+          const format = message.payload?.format ?? (message as any).format;
+          if (typeof videoId !== 'string' || typeof format !== 'string') {
+            sendResponse({ success: false, windows: [] });
+            return;
+          }
+          const resp = await fetch(`${API_BASE_URL}/transcripts/windows`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+            body: JSON.stringify({ videoId, format }),
+          });
+          if (!resp.ok) {
+            sendResponse({ success: false, windows: [] });
+            return;
+          }
+          sendResponse({ success: true, windows: parseWindowsResponse(await resp.json()) });
+        } catch {
+          sendResponse({ success: false, windows: [] });
+        }
+      })();
+      return true;
+    }
+
+    if (message.type === 'TRANSCRIBE_WINDOW') {
+      (async () => {
+        try {
+          const p = (message.payload ?? message) as Record<string, unknown>;
+          const { videoId, format, index, partial, startMs, audioBase64 } = p;
+          if (
+            typeof videoId !== 'string' ||
+            typeof format !== 'string' ||
+            typeof index !== 'number' || !Number.isInteger(index) || index < 0 ||
+            typeof partial !== 'boolean' ||
+            typeof startMs !== 'number' || !Number.isFinite(startMs) ||
+            typeof audioBase64 !== 'string' || audioBase64.length === 0 || audioBase64.length > 1_190_000
+          ) {
+            sendResponse({ ok: false, reason: 'failed' });
+            return;
+          }
+          const token = await getValidIdToken();
+          if (!token) {
+            sendResponse({ ok: false, reason: 'not_signed_in' });
+            return;
+          }
+          const body = JSON.stringify({ videoId, format, index, partial, startMs, audioBase64 });
+          const post = async (): Promise<{ status: number; json: unknown } | null> => {
+            try {
+              const resp = await fetch(`${API_BASE_URL}/transcripts/transcribe`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                body,
+              });
+              let json: unknown = null;
+              try { json = await resp.json(); } catch { /* non-JSON body */ }
+              return { status: resp.status, json };
+            } catch {
+              return null; // network error
+            }
+          };
+          let result = await post();
+          if (!result || shouldRetryTranscribe(result.status, result.json)) {
+            await new Promise((r) => setTimeout(r, 1000));
+            result = await post();
+          }
+          sendResponse(result ? parseTranscribeResponse(result.status, result.json) : { ok: false, reason: 'failed' });
+        } catch {
+          sendResponse({ ok: false, reason: 'failed' });
+        }
+      })();
+      return true;
     }
 
     if (message.type === 'OVERLAY_CALL_LLM') {
