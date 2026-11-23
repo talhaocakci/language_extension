@@ -12,7 +12,8 @@ import {
   PLAYER_TRACK_ATTRIBUTE,
 } from '../utils/youtube-timedtext';
 import type { AudioCaptureState, AudioWindowMessage } from '../utils/youtube-timedtext';
-import { installAudioCapture } from './youtube-audio-capture';
+import { decideAudioSync, installAudioCapture } from './youtube-audio-capture';
+import type { AudioSyncPrevious } from './youtube-audio-capture';
 
 const PUBLISH_INTERVAL_MS = 1000;
 const VIDEO_END_TOLERANCE_MS = 11_000;
@@ -69,7 +70,7 @@ function videoEndMs(player: any): number | undefined {
   }
 }
 
-let lastAudioVideoId = '';
+let lastSync: AudioSyncPrevious | null = null;
 
 function currentVideoId(player: any): string {
   try {
@@ -80,26 +81,39 @@ function currentVideoId(player: any): string {
   }
 }
 
+/**
+ * Brings the capture in line with the player's current video. Used by the publisher and by the request
+ * handler, so audio of another video is never served under the new id.
+ */
+function syncAudio(player: any): { videoId: string; known: boolean; hasCaptions: boolean } | null {
+  const videoId = currentVideoId(player);
+  if (!player || !videoId) return null;
+  const response = player.getPlayerResponse?.();
+  const tracks = response?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+  const responseVideoId = response?.videoDetails?.videoId;
+  const decision = decideAudioSync(lastSync, {
+    videoId,
+    generation: capture.generation(),
+    responseVideoId: typeof responseVideoId === 'string' ? responseVideoId : null,
+    captionTrackCount: Array.isArray(tracks) ? tracks.length : 0,
+  });
+  if (decision.resetCapture) capture.reset();
+  if (decision.setEnabled !== null) capture.setEnabled(decision.setEnabled);
+  lastSync = { videoId, generation: capture.generation() };
+  return { videoId, known: decision.known, hasCaptions: decision.hasCaptions };
+}
+
 function readAudioState(): string {
   try {
     const player = getPlayer();
-    const videoId = currentVideoId(player);
-    if (!player || !videoId) return '';
-
-    // Audio kept for another video must never be published under this one.
-    if (lastAudioVideoId && lastAudioVideoId !== videoId) capture.reset();
-    lastAudioVideoId = videoId;
-
-    const tracks = player.getPlayerResponse?.()?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-    const hasCaptions = Array.isArray(tracks) && tracks.length > 0;
-    capture.setEnabled(!hasCaptions);
-    if (hasCaptions) capture.reset();
+    const sync = syncAudio(player);
+    if (!sync || !sync.known) return '';
 
     const state: AudioCaptureState = {
-      videoId,
-      hasCaptions,
+      videoId: sync.videoId,
+      hasCaptions: sync.hasCaptions,
       format: capture.format(),
-      windows: hasCaptions
+      windows: sync.hasCaptions
         ? []
         : capture.windows(videoEndMs(player)).map((w) => ({ index: w.index, startMs: w.startMs, partial: w.partial })),
     };
@@ -129,6 +143,7 @@ document.addEventListener(AUDIO_WINDOW_REQUEST_EVENT, (event) => {
     if (!request || typeof request.requestId !== 'string' || !Number.isInteger(request.index)) return;
 
     const player = getPlayer();
+    syncAudio(player);
     const videoId = currentVideoId(player);
     const stale = typeof request.videoId === 'string' && request.videoId !== videoId;
     const endMs = videoEndMs(player);

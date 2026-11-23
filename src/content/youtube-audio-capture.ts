@@ -25,6 +25,39 @@ export interface AudioCapture {
   reset(): void;
   /** While disabled nothing is kept. A new audio buffer keeps the current flag. */
   setEnabled(enabled: boolean): void;
+  /** Incremented each time a new audio SourceBuffer starts the store over. */
+  generation(): number;
+}
+
+export interface AudioSyncPrevious { videoId: string; generation: number }
+export interface AudioSyncNow {
+  videoId: string;
+  generation: number;
+  /** Video the player response belongs to, or null when there is none yet. */
+  responseVideoId: string | null;
+  captionTrackCount: number;
+}
+export interface AudioSyncDecision {
+  /** Drop the kept clusters. */
+  resetCapture: boolean;
+  /** New enabled flag, or null to leave it alone. */
+  setEnabled: boolean | null;
+  /** False while the player response is not (yet) the current video's: publish "unknown". */
+  known: boolean;
+  hasCaptions: boolean;
+}
+
+/**
+ * What the bridge does on each tick or request. Audio kept for another video is dropped only when the
+ * same audio buffer is reused (a new buffer already started the store over); captions are trusted only
+ * when the player response belongs to the current video.
+ */
+export function decideAudioSync(prev: AudioSyncPrevious | null, now: AudioSyncNow): AudioSyncDecision {
+  const sameBufferNewVideo = prev !== null && prev.videoId !== now.videoId && prev.generation === now.generation;
+  const known = now.responseVideoId === now.videoId;
+  if (!known) return { resetCapture: sameBufferNewVideo, setEnabled: null, known: false, hasCaptions: false };
+  const hasCaptions = now.captionTrackCount > 0;
+  return { resetCapture: sameBufferNewVideo || hasCaptions, setEnabled: !hasCaptions, known: true, hasCaptions };
 }
 
 export type CaptureWrapperName = 'addSourceBuffer' | 'appendBuffer' | 'abort' | 'changeType';
@@ -57,6 +90,19 @@ function fromFirstCluster(bytes: Uint8Array): Uint8Array {
   return bytes.slice(Math.max(0, bytes.length - 3));
 }
 
+/** True when the bytes start with an EBML header; looks at the first 4 bytes without copying. */
+function peekEbml(data: unknown): boolean {
+  try {
+    if (data instanceof ArrayBuffer) return startsWithEbml(new Uint8Array(data, 0, Math.min(4, data.byteLength)));
+    if (ArrayBuffer.isView(data)) {
+      return startsWithEbml(new Uint8Array(data.buffer, data.byteOffset, Math.min(4, data.byteLength)));
+    }
+  } catch {
+    // Fall through: copy to be safe.
+  }
+  return true;
+}
+
 function copyBytes(data: unknown): Uint8Array | null {
   if (data instanceof ArrayBuffer) return new Uint8Array(data).slice();
   if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength).slice();
@@ -82,6 +128,11 @@ class AudioStore {
     this.enabled = true;
     this.pending = new Uint8Array(0);
     this.reset();
+  }
+
+  /** Whether bytes that do (or do not) start with an EBML header are worth copying. */
+  wants(startsWithHeader: boolean): boolean {
+    return this.enabled || !this.init || startsWithHeader;
   }
 
   /** Forget clusters and unfinished bytes; the init part of the current buffer stays. */
@@ -186,6 +237,7 @@ export function installAudioCapture(
   let format: AudioFormat = '';
   let audioBuffer: unknown = null;
   let keepAudio = false;
+  let generation = 0;
   const broken = (name: CaptureWrapperName): void => {
     if (options.breakCapture?.[name]) throw new Error(`capture broken in ${name}`);
   };
@@ -200,6 +252,7 @@ export function installAudioCapture(
         if (mime.startsWith('audio/')) {
           audioBuffer = buffer;
           store.startOver();
+          generation++;
           keepAudio = mime.startsWith('audio/webm');
           format = keepAudio ? 'webm-opus' : 'unsupported';
         }
@@ -215,7 +268,7 @@ export function installAudioCapture(
     sourceBufferProto.appendBuffer = function (this: unknown, ...args: any[]) {
       let bytes: Uint8Array | null = null;
       try {
-        if (this === audioBuffer && keepAudio) bytes = copyBytes(args[0]);
+        if (this === audioBuffer && keepAudio && store.wants(peekEbml(args[0]))) bytes = copyBytes(args[0]);
       } catch {
         // Capture problems must never reach the player.
       }
@@ -271,6 +324,7 @@ export function installAudioCapture(
     lastClusterMs: () => store.lastClusterMs(),
     reset: () => store.reset(),
     setEnabled: (value) => store.setEnabled(value),
+    generation: () => generation,
   };
   for (const proto of [mediaSourceProto, sourceBufferProto]) {
     if (proto) Object.defineProperty(proto, INSTALLED_MARK, { value: capture, enumerable: false });

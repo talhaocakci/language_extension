@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { MAX_KEPT_BYTES, installAudioCapture } from '../src/content/youtube-audio-capture';
+import { MAX_KEPT_BYTES, decideAudioSync, installAudioCapture } from '../src/content/youtube-audio-capture';
 import type { AudioCaptureOptions } from '../src/content/youtube-audio-capture';
 import { parseWebmAudio } from '../src/utils/webm-audio';
 import { cluster, concat, init } from './webm-fixture';
@@ -233,4 +233,58 @@ test('capture errors in addSourceBuffer and abort do not change the original cal
   const audio = ms.addSourceBuffer(OPUS);
   assert.equal(audio.abort(), 'aborted');
   assert.equal(calls.abort, 1);
+});
+
+test('generation counts new audio buffers', () => {
+  const { ms, capture } = setup();
+  assert.equal(capture.generation(), 0);
+  ms.addSourceBuffer(OPUS);
+  ms.addSourceBuffer('video/webm; codecs="vp09"');
+  ms.addSourceBuffer(OPUS);
+  assert.equal(capture.generation(), 2);
+});
+
+test('while disabled with the init known, appends are not copied unless they start with an init', () => {
+  const { ms, capture, appended } = setup();
+  const audio = ms.addSourceBuffer(OPUS);
+  audio.appendBuffer(concat(init(), cluster(0, 50)));
+  capture.setEnabled(false);
+  const media = concat(cluster(10001, 50), cluster(20001, 50));
+  const realSlice = Uint8Array.prototype.slice;
+  let copied = 0;
+  Uint8Array.prototype.slice = function (this: Uint8Array, ...a: any[]) { copied++; return realSlice.apply(this, a as any); };
+  try {
+    audio.appendBuffer(media);
+  } finally {
+    Uint8Array.prototype.slice = realSlice;
+  }
+  assert.equal(appended[appended.length - 1], media);
+  assert.equal(copied, 0);
+  assert.deepEqual(capture.windows(), []);
+});
+
+const A = { videoId: 'A', generation: 1 };
+const noCaptions = { responseVideoId: 'B', captionTrackCount: 0 };
+
+test('navigation to a new video with a new audio buffer does not reset', () => {
+  const d = decideAudioSync(A, { videoId: 'B', generation: 2, ...noCaptions });
+  assert.deepEqual(d, { resetCapture: false, setEnabled: true, known: true, hasCaptions: false });
+});
+
+test('navigation to a new video on the same audio buffer resets', () => {
+  assert.equal(decideAudioSync(A, { videoId: 'B', generation: 1, ...noCaptions }).resetCapture, true);
+});
+
+test('a stale player response for the previous video changes nothing and is not published', () => {
+  const d = decideAudioSync(A, { videoId: 'B', generation: 2, responseVideoId: 'A', captionTrackCount: 3 });
+  assert.deepEqual(d, { resetCapture: false, setEnabled: null, known: false, hasCaptions: false });
+  assert.equal(decideAudioSync(null, { videoId: 'B', generation: 0, responseVideoId: null, captionTrackCount: 0 }).setEnabled, null);
+});
+
+test('a captioned video disables and resets, a captionless one enables', () => {
+  const same = { videoId: 'B', generation: 2 };
+  const captioned = decideAudioSync(same, { ...same, responseVideoId: 'B', captionTrackCount: 2 });
+  assert.deepEqual(captioned, { resetCapture: true, setEnabled: false, known: true, hasCaptions: true });
+  const plain = decideAudioSync(same, { ...same, ...noCaptions });
+  assert.deepEqual(plain, { resetCapture: false, setEnabled: true, known: true, hasCaptions: false });
 });
