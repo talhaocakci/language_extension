@@ -38,6 +38,12 @@ let captionsRetryAttempts = 0;
 let activeCaptionLanguageCode = '';
 // Player track the loaded captions were requested for; '' when unknown.
 let captionTrackKeyInUse = '';
+// Player track the load in progress asked for; copied into
+// captionTrackKeyInUse only when that load's captions are accepted.
+let pendingCaptionTrackKey = '';
+// Last player track a track-change reload was started for, so a reload that
+// failed through all its retries is not started again until the track changes.
+let lastReloadAttemptKey = '';
 // Learning mode is opt-in for each video so ordinary viewing stays untouched.
 let overlayEnabled = false;
 let overlayLoading = false;
@@ -136,6 +142,8 @@ function resetTranscriptState(): void {
   allExtractedSubtitles = [];
   activeCaptionLanguageCode = '';
   captionTrackKeyInUse = '';
+  pendingCaptionTrackKey = '';
+  lastReloadAttemptKey = '';
   overlayLastSentenceKey = '';
   overlayLastWordIndex = -1;
   overlayLastSentenceIndex = -1;
@@ -666,7 +674,7 @@ async function fetchCaptionsFromAPI(videoId: string): Promise<SubtitleChunk[]> {
   // page-context script, which has access to YouTube's live window objects,
   // authenticated fetch, and the full DOM — all from within the page origin.
   console.log('Injecting page-context caption fetcher...');
-  const pageResult = await fetchCaptionsViaPageScript();
+  const pageResult = await fetchCaptionsViaPageScript(videoId);
   if (pageResult.length > 0) {
     console.log(`✓ Got ${pageResult.length} captions via page script`);
     return pageResult;
@@ -852,18 +860,19 @@ async function fetchCaptionsFromCaptionTracksFallback(): Promise<SubtitleChunk[]
   return [];
 }
 
-function readPlayerTrackForCurrentVideo(): PlayerTrackState | null {
+function readPlayerTrackForCurrentVideo(videoId = currentVideoId): PlayerTrackState | null {
   const state = parsePlayerTrackState(document.documentElement.getAttribute(PLAYER_TRACK_ATTRIBUTE));
-  return state && state.videoId === currentVideoId ? state : null;
+  return state && state.videoId === videoId ? state : null;
 }
 
 // The player only requests captions once they are switched on, and only it
 // knows which track the viewer chose, so ask the page-world bridge for both.
-async function waitForPlayerTrack(): Promise<PlayerTrackState | null> {
+async function waitForPlayerTrack(videoId: string): Promise<PlayerTrackState | null> {
   document.dispatchEvent(new CustomEvent(CAPTIONS_ON_EVENT));
   const deadline = Date.now() + 5000;
   while (Date.now() < deadline) {
-    const state = readPlayerTrackForCurrentVideo();
+    if (currentVideoId !== videoId) return null;
+    const state = readPlayerTrackForCurrentVideo(videoId);
     if (state) return state;
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
@@ -873,9 +882,17 @@ async function waitForPlayerTrack(): Promise<PlayerTrackState | null> {
 // Reload when the viewer picks another caption track (or translation) in the
 // player; the loaded sentences belong to the previous one.
 function reloadCaptionsIfPlayerTrackChanged(): void {
-  if (!overlayEnabled || !captionsExtracted || overlayLoading) return;
+  // A failed reload is already being retried by the retry timer.
+  if (!overlayEnabled || !captionsExtracted || overlayLoading || captionsRetryTimer !== null) return;
   const state = readPlayerTrackForCurrentVideo();
-  if (!state || playerTrackKey(state) === captionTrackKeyInUse) return;
+  if (!state) return;
+  const key = playerTrackKey(state);
+  if (key === captionTrackKeyInUse) {
+    lastReloadAttemptKey = '';
+    return;
+  }
+  if (key === lastReloadAttemptKey) return;
+  lastReloadAttemptKey = key;
 
   for (const key of Object.keys(sentenceAnalysisCache)) delete sentenceAnalysisCache[key];
   for (const key of Object.keys(wordMeaningCache)) delete wordMeaningCache[key];
@@ -883,24 +900,26 @@ function reloadCaptionsIfPlayerTrackChanged(): void {
   void ensureCaptionsForCurrentVideo(true);
 }
 
-async function fetchCaptionsViaPageScript(): Promise<SubtitleChunk[]> {
+async function fetchCaptionsViaPageScript(videoId: string): Promise<SubtitleChunk[]> {
   // The service worker intercepts YouTube's own timedtext request via webRequest
   // (which includes the pot= token) and re-fetches it from the extension context.
   // We just ask it for the result.
-  const track = await waitForPlayerTrack();
-  captionTrackKeyInUse = track ? playerTrackKey(track) : '';
+  const track = await waitForPlayerTrack(videoId);
+  if (currentVideoId !== videoId) return [];
+  pendingCaptionTrackKey = track ? playerTrackKey(track) : '';
 
   console.log('Requesting captured timedtext from service worker...');
   const response = await chrome.runtime.sendMessage({
     type: 'GET_TRANSCRIPT',
     payload: {
-      videoId: currentVideoId,
+      videoId,
       track,
       pageUrls: collectTimedtextUrls(
         performance.getEntriesByType('resource').map((entry) => entry.name)
       ),
     },
   });
+  if (currentVideoId !== videoId) return [];
 
   if (!response?.success || !response?.data) {
     console.log('Service worker GET_TRANSCRIPT failed:', response?.error);
@@ -2515,8 +2534,8 @@ async function ensureCaptionsForCurrentVideo(force = false): Promise<void> {
   }
 
   overlayLoading = true;
+  const requestedVideoId = currentVideoId;
   try {
-    const requestedVideoId = currentVideoId;
     const captions = await fetchCaptionsFromAPI(requestedVideoId);
     if (currentVideoId !== requestedVideoId) return;
     if (captions.length === 0) {
@@ -2524,7 +2543,8 @@ async function ensureCaptionsForCurrentVideo(force = false): Promise<void> {
       return;
     }
 
-    shapedSentences = shapeYouTubeSentences(lastRawCaptionText, captions, captionTrackKeyInUse || currentVideoId);
+    captionTrackKeyInUse = pendingCaptionTrackKey;
+    shapedSentences = shapeYouTubeSentences(lastRawCaptionText, captions, captionTrackKeyInUse || requestedVideoId);
     meaningfulSentences = shapedSentences ?? groupAndProcessSubtitles(captions);
     lastSubtitles = captions;
     captionsExtracted = true;
@@ -2536,10 +2556,15 @@ async function ensureCaptionsForCurrentVideo(force = false): Promise<void> {
     }
   } catch (error) {
     console.error('YouTube overlay caption load failed:', error);
-    scheduleCaptionRetry();
+    if (currentVideoId === requestedVideoId) scheduleCaptionRetry();
   } finally {
     overlayLoading = false;
     renderYouTubeOverlay();
+    // The viewer may have moved to another video and switched the overlay on
+    // while this load was running; that request returned early, so load now.
+    if (currentVideoId !== requestedVideoId && overlayEnabled) {
+      void ensureCaptionsForCurrentVideo();
+    }
   }
 }
 
@@ -2699,7 +2724,8 @@ chrome.runtime.onMessage.addListener((message: MessageRequest, sender, sendRespo
             } as MessageResponse);
             return;
           }
-          shapedSentences = shapeYouTubeSentences(lastRawCaptionText, captions, captionTrackKeyInUse || currentVideoId);
+          captionTrackKeyInUse = pendingCaptionTrackKey;
+          shapedSentences = shapeYouTubeSentences(lastRawCaptionText, captions, captionTrackKeyInUse || requestedVideoId);
           meaningfulSentences = shapedSentences ?? groupAndProcessSubtitles(captions);
           lastSubtitles = captions;
           captionsExtracted = true;

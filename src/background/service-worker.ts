@@ -507,10 +507,10 @@ chrome.runtime.onMessage.addListener((message: MessageRequest, sender, sendRespo
       (async () => {
         // pageUrls come from the page's own resource timings, so requests made
         // while this worker was asleep still count.
-        const pick = (): string | null => pickTimedtextUrl(
+        const pick = (forTrack: TimedtextTrack | null = track): string | null => pickTimedtextUrl(
           [...pageUrls, ...(capturedTimedtextUrls.get(tabId) || [])],
           requestedVideoId,
-          track,
+          forTrack,
         );
 
         // Poll up to 10 s for the player to make its own timedtext request
@@ -535,6 +535,12 @@ chrome.runtime.onMessage.addListener((message: MessageRequest, sender, sendRespo
           if (!track && untranslated.searchParams.has('tlang')) {
             untranslated.searchParams.delete('tlang');
             attempts.unshift(untranslated.toString());
+          }
+          // A re-pointed request for the player track can come back empty;
+          // then fall back once to the best request picked without a track.
+          if (track) {
+            const withoutTrack = pick(null);
+            if (withoutTrack && withoutTrack !== url) attempts.push(withoutTrack);
           }
 
           for (const attempt of attempts) {
