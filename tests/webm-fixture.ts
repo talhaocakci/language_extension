@@ -26,7 +26,11 @@ export function init(): Uint8Array {
 
 /** Cluster with an 8-byte size, Timecode `E7 84 <4 bytes>` and one SimpleBlock of `payloadLen` bytes. */
 export function cluster(timecodeMs: number, payloadLen: number): Uint8Array {
-  const block = concat(new Uint8Array([0xa3, 0x80 | payloadLen]), filler(payloadLen));
+  // SimpleBlock with an 8-byte size field so payloads can be large.
+  const blockSize = new Uint8Array(8);
+  blockSize[0] = 0x01;
+  for (let i = 0; i < 7; i++) blockSize[7 - i] = Math.floor(payloadLen / 2 ** (8 * i)) & 0xff;
+  const block = concat(new Uint8Array([0xa3]), blockSize, filler(payloadLen));
   const body = concat(
     new Uint8Array([
       0xe7, 0x84,

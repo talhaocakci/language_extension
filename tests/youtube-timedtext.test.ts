@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   collectTimedtextUrls,
   getTimedtextLanguage,
+  parseAudioCaptureState,
   parsePlayerTrackState,
   pickTimedtextUrl,
   playerTrackKey
@@ -106,4 +107,21 @@ test('requests from other hosts or over plain http are ignored', () => {
   const plain = 'http://www.youtube.com/api/timedtext?v=abc&lang=de&pot=T';
   assert.equal(pickTimedtextUrl([evil, plain], 'abc'), null);
   assert.equal(pickTimedtextUrl([evil, plain], 'abc', { lang: 'de', kind: '', tlang: '' }), null);
+});
+
+test('audio capture state survives a round trip', () => {
+  const state = {
+    videoId: 'abc',
+    hasCaptions: false,
+    format: 'webm-opus' as const,
+    windows: [{ index: 0, startMs: 0, partial: false }, { index: 3, startMs: 90001, partial: true }],
+  };
+  assert.deepEqual(parseAudioCaptureState(JSON.stringify(state)), state);
+});
+
+test('junk audio capture state is rejected', () => {
+  assert.equal(parseAudioCaptureState(null), null);
+  assert.equal(parseAudioCaptureState('not json'), null);
+  assert.equal(parseAudioCaptureState('{"videoId":"a","hasCaptions":false,"format":"mp3","windows":[]}'), null);
+  assert.equal(parseAudioCaptureState('{"videoId":"a","hasCaptions":false,"format":"","windows":[{"index":"x"}]}'), null);
 });

@@ -125,3 +125,35 @@ export function getTimedtextLanguage(url: string): string {
   const params = parse(url)?.searchParams;
   return params?.get('tlang') || params?.get('lang') || '';
 }
+
+// Audio capture (videos without captions). The page-world bridge publishes
+// which audio windows it holds on this attribute and answers a request for one
+// window's file with a window message; the audio never goes anywhere else.
+export const AUDIO_STATE_ATTRIBUTE = 'data-gff-audio-state';
+export const AUDIO_WINDOW_REQUEST_EVENT = 'gff-audio-window-request'; // detail: JSON string { requestId, index }
+export const AUDIO_WINDOW_MESSAGE = 'gff-audio-window'; // window.postMessage type
+
+export interface AudioCaptureState {
+  videoId: string;
+  hasCaptions: boolean;
+  format: 'webm-opus' | 'unsupported' | '';
+  windows: { index: number; startMs: number; partial: boolean }[];
+}
+
+export function parseAudioCaptureState(raw: string | null | undefined): AudioCaptureState | null {
+  if (!raw) return null;
+  try {
+    const value = JSON.parse(raw) as Record<string, unknown>;
+    if (typeof value.videoId !== 'string' || typeof value.hasCaptions !== 'boolean') return null;
+    if (value.format !== 'webm-opus' && value.format !== 'unsupported' && value.format !== '') return null;
+    if (!Array.isArray(value.windows)) return null;
+    const windows: AudioCaptureState['windows'] = [];
+    for (const w of value.windows as Record<string, unknown>[]) {
+      if (!w || typeof w.index !== 'number' || typeof w.startMs !== 'number' || typeof w.partial !== 'boolean') return null;
+      windows.push({ index: w.index, startMs: w.startMs, partial: w.partial });
+    }
+    return { videoId: value.videoId, hasCaptions: value.hasCaptions, format: value.format, windows };
+  } catch {
+    return null;
+  }
+}
