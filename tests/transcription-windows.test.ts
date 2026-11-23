@@ -35,6 +35,36 @@ test('a window whose audio stops early before a seek is partial', () => {
   assert.equal(w0.partial, true);
   assert.equal(w3.partial, false);
 });
+test('one missing cluster makes a window partial', () => {
+  assert.equal(readyWindows(tc(0, 10001, 30001, 40001, 50001))[0].partial, true);
+  assert.equal(readyWindows(tc(0, 10000, 30000, 40000))[0].partial, true);
+});
+test('continuous audio gives complete windows and keeps the last one waiting', () => {
+  const ms = Array.from({ length: 18 }, (_, i) => i * 10_000 + (i > 0 ? 1 : 0));
+  assert.equal(ms[17], 170001);
+  const ready = readyWindows(tc(...ms));
+  assert.deepEqual(ready.map(w => [w.index, w.partial]), [[0, false], [1, false], [2, false], [3, false], [4, false]]);
+});
+test('a video end close after the last cluster completes the last window', () => {
+  const ms = Array.from({ length: 19 }, (_, i) => i * 10_000 + (i > 0 ? 1 : 0));
+  const ready = readyWindows(tc(...ms), 186_521);
+  const last = ready[ready.length - 1];
+  assert.deepEqual([last.index, last.partial], [6, false]);
+});
+test('clusters out of order or repeated do not throw and index the first occurrences', () => {
+  const a = readyWindows(tc(0, 10001, 20001, 30001, 100001, 110001, 120001, 130001, 10001, 20001));
+  const w0a = a.find(w => w.index === 0)!;
+  assert.equal(w0a.partial, false);
+  assert.deepEqual(w0a.clusterIndexes, [0, 1, 2]);
+  const b = readyWindows(tc(0, 10001, 20001, 30001, 40001, 50001, 10001, 20001));
+  const w0b = b.find(w => w.index === 0)!;
+  assert.equal(w0b.partial, false);
+  assert.deepEqual(w0b.clusterIndexes, [0, 1, 2]);
+});
+test('empty and invalid input yields nothing', () => {
+  assert.deepEqual(readyWindows([]), []);
+  assert.deepEqual(readyWindows(tc(NaN, -5, Infinity)), []);
+});
 test('the window at the playhead goes first, stored and in-flight ones are skipped', () => {
   const ready = readyWindows(tc(0, 10001, 20001, 30001, 40001, 50001, 60001, 70001, 80001, 90001));
   assert.equal(nextWindowToSend(ready, new Set(), new Set(), 35_000)!.index, 1);

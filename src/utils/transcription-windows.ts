@@ -13,20 +13,34 @@ function windowOf(timecodeMs: number): number {
   return Math.floor((timecodeMs + WINDOW_EDGE_TOLERANCE_MS) / WINDOW_MS);
 }
 
-/** Lower median of the spacings between neighbouring clusters; 10 000 ms with fewer than two spacings. */
-function medianSpacing(clusters: ClusterTime[]): number {
+const GAP_FACTOR = 1.5;
+
+/** Lower median of the spacings between neighbouring times; 10 000 ms with fewer than two spacings. */
+function medianSpacing(times: number[]): number {
   const spacings: number[] = [];
-  for (let i = 1; i < clusters.length; i++) spacings.push(clusters[i].timecodeMs - clusters[i - 1].timecodeMs);
+  for (let i = 1; i < times.length; i++) spacings.push(times[i] - times[i - 1]);
   if (spacings.length < 2) return DEFAULT_SPACING_MS;
   spacings.sort((a, b) => a - b);
   return spacings[Math.floor((spacings.length - 1) / 2)];
 }
 
-/** Windows that can be sent now. videoEndMs: pass when the stream's end has been captured. */
+/**
+ * Windows that can be sent now. videoEndMs: pass when the stream's end has been captured.
+ * Clusters may come in any order and repeat; invalid timecodes are ignored and clusterIndexes
+ * refer to positions in the input (first occurrence of a repeated timecode).
+ */
 export function readyWindows(clusters: ClusterTime[], videoEndMs?: number): ReadyWindow[] {
-  const groups = new Map<number, number[]>();
-  clusters.forEach((cluster, i) => {
-    const index = windowOf(cluster.timecodeMs);
+  const sorted: { t: number; pos: number }[] = [];
+  clusters.forEach((cluster, pos) => {
+    const t = cluster?.timecodeMs;
+    if (typeof t === 'number' && Number.isFinite(t) && t >= 0) sorted.push({ t, pos });
+  });
+  sorted.sort((a, b) => a.t - b.t || a.pos - b.pos);
+  const unique = sorted.filter((entry, i) => i === 0 || entry.t !== sorted[i - 1].t);
+
+  const groups = new Map<number, number[]>(); // window index -> positions in `unique`
+  unique.forEach((entry, i) => {
+    const index = windowOf(entry.t);
     const group = groups.get(index);
     if (group) group.push(i);
     else groups.set(index, [i]);
@@ -34,27 +48,27 @@ export function readyWindows(clusters: ClusterTime[], videoEndMs?: number): Read
   if (groups.size === 0) return [];
 
   const maxIndex = Math.max(...groups.keys());
-  const maxGap = 2 * medianSpacing(clusters);
+  const maxGap = GAP_FACTOR * medianSpacing(unique.map((entry) => entry.t));
   const result: ReadyWindow[] = [];
 
   for (const index of [...groups.keys()].sort((a, b) => a - b)) {
     const isLast = index === maxIndex;
     if (isLast && videoEndMs === undefined) continue;
 
-    const indexes = groups.get(index)!;
-    const first = clusters[indexes[0]].timecodeMs;
-    const lastPos = indexes[indexes.length - 1];
-    const last = clusters[lastPos].timecodeMs;
+    const members = groups.get(index)!;
+    const first = unique[members[0]].t;
+    const lastPos = members[members.length - 1];
+    const last = unique[lastPos].t;
 
     let partial = first - index * WINDOW_MS > WINDOW_EDGE_TOLERANCE_MS;
-    for (let k = 1; k < indexes.length && !partial; k++) {
-      if (clusters[indexes[k]].timecodeMs - clusters[indexes[k - 1]].timecodeMs > maxGap) partial = true;
+    for (let k = 1; k < members.length && !partial; k++) {
+      if (unique[members[k]].t - unique[members[k - 1]].t > maxGap) partial = true;
     }
     if (!partial) {
       if (isLast) partial = (videoEndMs as number) - last > maxGap;
-      else partial = clusters[lastPos + 1].timecodeMs - last > maxGap;
+      else partial = unique[lastPos + 1].t - last > maxGap;
     }
-    result.push({ index, startMs: first, partial, clusterIndexes: indexes });
+    result.push({ index, startMs: first, partial, clusterIndexes: members.map((m) => unique[m].pos) });
   }
   return result;
 }
