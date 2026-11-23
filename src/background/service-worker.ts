@@ -1,4 +1,9 @@
-import type { MessageRequest, MessageResponse } from '../types/common';
+import {
+  USER_PREFERENCES_STORAGE_KEY,
+  normalizeStoredUserPreferences,
+  type MessageRequest,
+  type MessageResponse,
+} from '../types/common';
 import type { SubtitleChunk, MeaningfulSentence } from '../types/subtitle';
 import { groupAndProcessSubtitles } from '../utils/subtitle-processor';
 import {
@@ -377,9 +382,16 @@ chrome.runtime.onMessage.addListener((message: MessageRequest, sender, sendRespo
     if (handleNetflixAudioExperimentMessage(message, sender, sendResponse)) return true;
 
     if (message.type === 'GET_PREFERENCES') {
-      // LLM settings are now backend-managed; nothing to return from storage
-      sendResponse({ success: true, data: {} });
-      return;
+      // LLM settings are backend-managed; only browser-side switches are stored here.
+      (async () => {
+        try {
+          const stored = await chrome.storage.sync.get(USER_PREFERENCES_STORAGE_KEY);
+          sendResponse({ success: true, data: normalizeStoredUserPreferences(stored[USER_PREFERENCES_STORAGE_KEY]) });
+        } catch (error) {
+          sendResponse({ success: false, error: String(error), data: normalizeStoredUserPreferences(null) });
+        }
+      })();
+      return true;
     }
 
     if (message.type === 'GET_LANGUAGE_PREFERENCES') {
@@ -434,9 +446,21 @@ chrome.runtime.onMessage.addListener((message: MessageRequest, sender, sendRespo
     }
 
     if (message.type === 'SET_PREFERENCES') {
-      // LLM settings no longer stored client-side
-      sendResponse({ success: true });
-      return;
+      // LLM settings are no longer stored client-side; unknown fields are dropped.
+      (async () => {
+        try {
+          const stored = await chrome.storage.sync.get(USER_PREFERENCES_STORAGE_KEY);
+          const next = normalizeStoredUserPreferences({
+            ...normalizeStoredUserPreferences(stored[USER_PREFERENCES_STORAGE_KEY]),
+            ...(message.payload && typeof message.payload === 'object' ? message.payload : {}),
+          });
+          await chrome.storage.sync.set({ [USER_PREFERENCES_STORAGE_KEY]: next });
+          sendResponse({ success: true, data: next });
+        } catch (error) {
+          sendResponse({ success: false, error: String(error) });
+        }
+      })();
+      return true;
     }
 
     if (message.type === 'GET_ID_TOKEN') {

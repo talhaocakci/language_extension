@@ -478,3 +478,19 @@ body {
 ::-webkit-scrollbar-thumb:hover {
   background: #764ba2;
 }
+
+.settingGroup.settingCheckbox label {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  cursor: pointer;
+  text-transform: none;
+  letter-spacing: 0;
+  line-height: 1.4;
+}
+
+.settingGroup.settingCheckbox input {
+  margin: 1px 0 0;
+  padding: 0;
+  flex: none;
+}

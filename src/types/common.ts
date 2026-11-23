@@ -29,6 +29,21 @@ export interface UserPreferences {
   theme: 'light' | 'dark';
   language: string;
   autoSaveEnabled: boolean;
+  /** Transcribe YouTube videos without captions without asking first (uses credits). */
+  alwaysTranscribeCaptionless: boolean;
+}
+
+/** The part of the preferences that GET_PREFERENCES / SET_PREFERENCES store in the browser. */
+export type StoredUserPreferences = Pick<UserPreferences, 'alwaysTranscribeCaptionless'>;
+
+export const USER_PREFERENCES_STORAGE_KEY = 'user_preferences';
+export const DEFAULT_STORED_USER_PREFERENCES: StoredUserPreferences = { alwaysTranscribeCaptionless: false };
+
+export function normalizeStoredUserPreferences(value: unknown): StoredUserPreferences {
+  const raw = value && typeof value === 'object' ? value as Record<string, unknown> : {};
+  return {
+    alwaysTranscribeCaptionless: raw.alwaysTranscribeCaptionless === true,
+  };
 }
 
 export interface StorageData {

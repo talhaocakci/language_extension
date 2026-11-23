@@ -1,15 +1,27 @@
 import type { SubtitleChunk, MeaningfulSentence } from '../types/subtitle';
-import type { MessageRequest, MessageResponse, PlaybackControlPayload } from '../types/common';
+import {
+  USER_PREFERENCES_STORAGE_KEY,
+  normalizeStoredUserPreferences,
+  type MessageRequest,
+  type MessageResponse,
+  type PlaybackControlPayload,
+} from '../types/common';
 import { groupAndProcessSubtitles } from '../utils/subtitle-processor';
 import { shapeYouTubeSentences } from '../utils/youtube-sentences';
 import {
+  AUDIO_STATE_ATTRIBUTE,
   CAPTIONS_ON_EVENT,
   PLAYER_TRACK_ATTRIBUTE,
   collectTimedtextUrls,
+  parseAudioCaptureState,
   parsePlayerTrackState,
   playerTrackKey,
   type PlayerTrackState
 } from '../utils/youtube-timedtext';
+import { bytesToBase64, type TranscribeResult } from '../utils/transcript-api';
+import { TranscriptionController, type TranscriptionPhase } from './youtube-transcription';
+import { browserWindowFileEnv, requestAudioWindowFile } from './audio-window-request';
+import { AcceptPauseTracker } from './transcription-playback';
 import {
   BROWSER_EXTENSION_PREFERENCES_STORAGE_KEY,
   DEFAULT_EXPLANATION_LANGUAGE,
@@ -884,6 +896,7 @@ async function waitForPlayerTrack(videoId: string): Promise<PlayerTrackState | n
 function reloadCaptionsIfPlayerTrackChanged(): void {
   // A failed reload is already being retried by the retry timer.
   if (!overlayEnabled || !captionsExtracted || overlayLoading || captionsRetryTimer !== null) return;
+  if (transcription.phase() !== 'idle') return; // no caption track: transcription owns the sentences
   const state = readPlayerTrackForCurrentVideo();
   if (!state) return;
   const key = playerTrackKey(state);
@@ -1947,6 +1960,34 @@ function syncYouTubeOverlayWithPlayer(overlay: HTMLDivElement): void {
   suppressYouTubeNativeCaptions();
 }
 
+function createOverlayToolbarButton(label: string, title: string): HTMLButtonElement {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.textContent = label;
+  button.title = title;
+  button.setAttribute('aria-label', title);
+  button.style.cssText = `
+    pointer-events: auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 28px;
+    height: 25px;
+    padding: 0 7px;
+    background: rgba(111, 143, 255, 0.16);
+    border: 1px solid rgba(154, 181, 255, 0.48);
+    color: #edf3ff;
+    border-radius: 8px;
+    font-size: 12px;
+    line-height: 1;
+    font-weight: 600;
+    cursor: pointer;
+  `;
+  button.addEventListener('mouseenter', () => { button.style.background = 'rgba(111, 143, 255, 0.22)'; });
+  button.addEventListener('mouseleave', () => { button.style.background = 'rgba(111, 143, 255, 0.16)'; });
+  return button;
+}
+
 function ensureYouTubeOverlay(): HTMLDivElement {
   const existing = document.getElementById(YT_OVERLAY_ID) as HTMLDivElement | null;
   if (existing) return existing;
@@ -1995,33 +2036,7 @@ function ensureYouTubeOverlay(): HTMLDivElement {
     gap: 8px;
   `;
 
-  const createToolbarButton = (label: string, title: string): HTMLButtonElement => {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.textContent = label;
-    button.title = title;
-    button.setAttribute('aria-label', title);
-    button.style.cssText = `
-      pointer-events: auto;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      min-width: 28px;
-      height: 25px;
-      padding: 0 7px;
-      background: rgba(111, 143, 255, 0.16);
-      border: 1px solid rgba(154, 181, 255, 0.48);
-      color: #edf3ff;
-      border-radius: 8px;
-      font-size: 12px;
-      line-height: 1;
-      font-weight: 600;
-      cursor: pointer;
-    `;
-    button.addEventListener('mouseenter', () => { button.style.background = 'rgba(111, 143, 255, 0.22)'; });
-    button.addEventListener('mouseleave', () => { button.style.background = 'rgba(111, 143, 255, 0.16)'; });
-    return button;
-  };
+  const createToolbarButton = createOverlayToolbarButton;
 
   const targetLanguageFlag = document.createElement('span');
   targetLanguageFlag.id = YT_TARGET_LANGUAGE_VALUE_ID;
@@ -2408,6 +2423,15 @@ function renderYouTubeOverlay(): void {
     return;
   }
 
+  const transcriptionPhase = transcription.phase();
+  if (transcriptionPhase !== 'idle') {
+    syncTranscriptionSentences();
+    if (shouldShowTranscriptionStatus(transcriptionPhase)) {
+      renderTranscriptionStatus(transcriptionPhase);
+      return;
+    }
+  }
+
   const target = getOverlayTargetSentence(currentTimeMs);
   if (!target) {
     hideYouTubeOverlay();
@@ -2480,6 +2504,7 @@ function setYouTubeOverlayEnabled(enabled: boolean): void {
   if (overlayEnabled && meaningfulSentences.length === 0) {
     void ensureCaptionsForCurrentVideo();
   }
+  maybeAutoAcceptTranscription();
   renderYouTubeOverlay();
 }
 
@@ -2528,6 +2553,12 @@ function scheduleCaptionRetry(): void {
 
 async function ensureCaptionsForCurrentVideo(force = false): Promise<void> {
   if (!currentVideoId) return;
+  if (transcription.phase() !== 'idle') {
+    // The player has no caption track for this video; the transcription controller supplies the sentences.
+    syncTranscriptionSentences();
+    renderYouTubeOverlay();
+    return;
+  }
   if (overlayLoading) return;
   if (!force && captionsExtracted && captionsCacheVideoId === currentVideoId && meaningfulSentences.length > 0) {
     return;
@@ -2538,6 +2569,7 @@ async function ensureCaptionsForCurrentVideo(force = false): Promise<void> {
   try {
     const captions = await fetchCaptionsFromAPI(requestedVideoId);
     if (currentVideoId !== requestedVideoId) return;
+    if (transcription.phase() !== 'idle') return;
     if (captions.length === 0) {
       scheduleCaptionRetry();
       return;
@@ -2568,6 +2600,255 @@ async function ensureCaptionsForCurrentVideo(force = false): Promise<void> {
   }
 }
 
+// ── Transcription for videos without captions ───────────────────────────────
+// When the player reports no caption track, the controller transcribes the
+// audio the player buffered ahead of the playhead — only after the learner
+// accepted for this video (or the "always" setting is on).
+
+const TRANSCRIPT_WINDOWS_TIMEOUT_MS = 15_000;
+const TRANSCRIBE_WINDOW_TIMEOUT_MS = 120_000;
+const SIDE_PANEL_REQUEST_RECENT_MS = 30_000;
+const YT_SIGN_IN_PROMPT = 'Not logged in. Please sign in from the extension popup.';
+
+let alwaysTranscribeCaptionless = false;
+let transcriptionAutoAcceptedVideoId = '';
+let transcriptionAppliedSentences: MeaningfulSentence[] | null = null;
+let transcriptionLastPhase: TranscriptionPhase = 'idle';
+let lastSubtitlesRequestAtMs = 0;
+let transcriptionMediaListenersBound = false;
+const acceptPauseTracker = new AcceptPauseTracker();
+const transcriptionWindowFileEnv = browserWindowFileEnv();
+
+/** Resolves the service worker's answer, or undefined on rejection, no answer, or timeout. */
+function sendRuntimeMessageWithTimeout(message: MessageRequest, timeoutMs: number): Promise<any> {
+  return new Promise((resolve) => {
+    const timer = window.setTimeout(() => resolve(undefined), timeoutMs);
+    const done = (value: unknown) => {
+      window.clearTimeout(timer);
+      resolve(value);
+    };
+    try {
+      chrome.runtime.sendMessage(message).then(done, () => done(undefined));
+    } catch {
+      done(undefined);
+    }
+  });
+}
+
+function isTranscribeResult(value: unknown): value is TranscribeResult {
+  if (!value || typeof value !== 'object') return false;
+  const v = value as Record<string, unknown>;
+  if (v.ok === true) return !!v.window && typeof v.window === 'object';
+  return v.ok === false && ['not_signed_in', 'insufficient_credits', 'busy', 'failed'].includes(String(v.reason));
+}
+
+const transcription = new TranscriptionController(
+  {
+    readState: () => parseAudioCaptureState(document.documentElement.getAttribute(AUDIO_STATE_ATTRIBUTE)),
+    requestWindowFile: (index) => requestAudioWindowFile(transcriptionWindowFileEnv, currentVideoId, index),
+    fetchStored: async (videoId, format) => {
+      const response = await sendRuntimeMessageWithTimeout(
+        { type: 'TRANSCRIPT_WINDOWS', payload: { videoId, format } },
+        TRANSCRIPT_WINDOWS_TIMEOUT_MS,
+      );
+      return response?.success && Array.isArray(response.windows) ? response.windows : [];
+    },
+    transcribe: async (req) => {
+      const response = await sendRuntimeMessageWithTimeout(
+        {
+          type: 'TRANSCRIBE_WINDOW',
+          payload: {
+            videoId: req.videoId,
+            format: req.format,
+            index: req.index,
+            partial: req.partial,
+            startMs: req.startMs,
+            audioBase64: bytesToBase64(req.file),
+          },
+        },
+        TRANSCRIBE_WINDOW_TIMEOUT_MS,
+      );
+      return isTranscribeResult(response) ? response : { ok: false, reason: 'failed' };
+    },
+    playheadMs: () => getCurrentTimeMs() ?? 0,
+    now: () => Date.now(),
+  },
+  handleTranscriptionChange,
+);
+
+function transcriptionStatusText(phase: TranscriptionPhase): string {
+  switch (phase) {
+    case 'offer': return 'This video has no captions. Transcribe it? Uses credits.';
+    case 'unavailable': return 'Transcription is not available for this video.';
+    case 'no_credits': return 'Not enough credits to continue transcribing.';
+    case 'signed_out': return YT_SIGN_IN_PROMPT;
+    default: return 'Preparing subtitles…';
+  }
+}
+
+function shouldShowTranscriptionStatus(phase: TranscriptionPhase): boolean {
+  if (phase === 'idle' || phase === 'ready') return false;
+  if (phase === 'offer' || phase === 'preparing') return true;
+  // no_credits / signed_out / unavailable: sentences already received still show where they cover the playhead.
+  return !(meaningfulSentences.length > 0 && transcription.coversPlayhead());
+}
+
+/** Makes the controller's sentences the overlay's sentence list while the video has no captions. */
+function syncTranscriptionSentences(): void {
+  if (transcription.phase() === 'idle') {
+    if (transcriptionAppliedSentences && meaningfulSentences === transcriptionAppliedSentences) {
+      meaningfulSentences = [];
+      shapedSentences = null;
+      captionsExtracted = false;
+      captionsCacheVideoId = '';
+      overlayStableSentenceIndex = -1;
+      overlayLastSentenceIndex = -1;
+    }
+    transcriptionAppliedSentences = null;
+    return;
+  }
+  const sentences = transcription.sentences();
+  if (meaningfulSentences === sentences && shapedSentences === sentences) return;
+  transcriptionAppliedSentences = sentences;
+  meaningfulSentences = sentences;
+  shapedSentences = sentences;
+  lastSubtitles = [];
+  captionsExtracted = sentences.length > 0;
+  captionsCacheVideoId = currentVideoId;
+  overlayStableSentenceIndex = -1;
+  overlayLastSentenceIndex = -1;
+  const language = normalizeLanguageCode(transcription.language());
+  if (language && !activeCaptionLanguageCode) {
+    activeCaptionLanguageCode = language;
+    renderOverlayLanguagePair();
+  }
+}
+
+function renderTranscriptionStatus(phase: TranscriptionPhase): void {
+  const key = `transcription|${phase}`;
+  if (key === overlayLastSentenceKey && !overlayHidden) {
+    const now = performance.now();
+    if (now - overlayLastAnchorSyncTimeMs >= 350) {
+      const existing = document.getElementById(YT_OVERLAY_ID) as HTMLDivElement | null;
+      if (existing) syncYouTubeOverlayWithPlayer(existing);
+      overlayLastAnchorSyncTimeMs = now;
+    }
+    return;
+  }
+
+  const overlay = ensureYouTubeOverlay();
+  const sentenceWrap = overlay.querySelector('.sl-yt-overlay-sentence') as HTMLDivElement | null;
+  if (!sentenceWrap) return;
+
+  overlayCurrentSentence = null;
+  overlayExplainVisible = false;
+  overlayExplainLoading = false;
+  overlayExplainError = null;
+  hideOverlayWordPopup();
+
+  sentenceWrap.innerHTML = '';
+  const box = document.createElement('div');
+  box.className = 'sl-yt-overlay-transcription-status';
+  box.style.cssText = `
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    font-size: clamp(14px, 1.5vw, 19px);
+  `;
+  const text = document.createElement('div');
+  text.textContent = transcriptionStatusText(phase);
+  if (phase === 'signed_out') text.style.color = '#ffcccb';
+  box.appendChild(text);
+  if (phase === 'offer') {
+    const button = createOverlayToolbarButton('Transcribe', 'Transcribe this video');
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      acceptTranscriptionFromOverlay();
+    });
+    box.appendChild(button);
+  }
+  sentenceWrap.appendChild(box);
+
+  renderOverlayLanguagePair();
+  renderExplainPanel();
+  setExplainButtonState();
+  overlay.style.opacity = '1';
+  overlayHidden = false;
+  syncYouTubeOverlayWithPlayer(overlay);
+  overlayLastAnchorSyncTimeMs = performance.now();
+
+  overlayLastSentenceKey = key;
+  overlayLastWordIndex = -1;
+  overlayLastSentenceIndex = -1;
+}
+
+function acceptTranscriptionFromOverlay(): void {
+  if (transcription.phase() !== 'offer') return;
+  const video = getVideoElement();
+  const playing = !!video && !video.paused && !video.ended;
+  // The only playback control here: one pause, resumed when subtitles are ready.
+  if (video && acceptPauseTracker.onAccept(playing, false)) video.pause();
+  transcription.accept();
+  void transcription.tick();
+}
+
+/** "Always transcribe": accept once the video would show the offer, while the overlay or side panel is in use. */
+function maybeAutoAcceptTranscription(): void {
+  if (!alwaysTranscribeCaptionless || !currentVideoId) return;
+  if (transcriptionAutoAcceptedVideoId === currentVideoId) return;
+  if (transcription.phase() !== 'offer') return;
+  const sidePanelRecent = lastSubtitlesRequestAtMs > 0 && Date.now() - lastSubtitlesRequestAtMs < SIDE_PANEL_REQUEST_RECENT_MS;
+  if (!overlayEnabled && !sidePanelRecent) return;
+  transcriptionAutoAcceptedVideoId = currentVideoId;
+  acceptPauseTracker.onAccept(false, true); // never pauses
+  transcription.accept();
+  void transcription.tick();
+}
+
+function handleTranscriptionChange(): void {
+  syncTranscriptionSentences();
+  const phase = transcription.phase();
+  if (phase !== transcriptionLastPhase) {
+    transcriptionLastPhase = phase;
+    if (acceptPauseTracker.onPhase(phase)) {
+      const video = getVideoElement();
+      if (video?.paused) void video.play().catch(() => undefined);
+    }
+  }
+  maybeAutoAcceptTranscription();
+  renderYouTubeOverlay();
+}
+
+function resetTranscriptionForVideo(videoId: string): void {
+  acceptPauseTracker.reset();
+  transcriptionAppliedSentences = null;
+  transcriptionLastPhase = 'idle';
+  transcriptionAutoAcceptedVideoId = '';
+  lastSubtitlesRequestAtMs = 0;
+  transcription.reset(videoId);
+}
+
+function bindTranscriptionMediaListeners(): void {
+  if (transcriptionMediaListenersBound) return;
+  transcriptionMediaListenersBound = true;
+  // Media events do not bubble; listen in the capture phase for whichever <video> the player uses.
+  document.addEventListener('play', (event) => {
+    if (event.target instanceof HTMLVideoElement && event.target === getVideoElement()) acceptPauseTracker.onPlayEvent();
+  }, true);
+  document.addEventListener('pause', (event) => {
+    if (event.target instanceof HTMLVideoElement && event.target === getVideoElement()) acceptPauseTracker.onPauseEvent();
+  }, true);
+}
+
+function loadTranscriptionPreferences(): void {
+  void sendRuntimeMessageWithTimeout({ type: 'GET_PREFERENCES' }, TRANSCRIPT_WINDOWS_TIMEOUT_MS).then((response) => {
+    alwaysTranscribeCaptionless = normalizeStoredUserPreferences(response?.data).alwaysTranscribeCaptionless;
+    maybeAutoAcceptTranscription();
+  });
+}
+
 function initializeYouTubeExtension(): void {
   currentVideoId = getVideoId();
   
@@ -2579,6 +2860,9 @@ function initializeYouTubeExtension(): void {
   console.log('Initializing Subtitle Learning Extension for YouTube video:', currentVideoId);
 
   bindOverlayShortcutListeners();
+  bindTranscriptionMediaListeners();
+  loadTranscriptionPreferences();
+  resetTranscriptionForVideo(currentVideoId);
   injectYouTubeToggleButton();
   setupSubtitleObserver();
 
@@ -2591,6 +2875,8 @@ function initializeYouTubeExtension(): void {
   uiEnsureInterval = window.setInterval(() => {
     injectYouTubeToggleButton();
     reloadCaptionsIfPlayerTrackChanged();
+    void transcription.tick();
+    maybeAutoAcceptTranscription();
   }, 1200);
 
   window.addEventListener('yt-navigate-finish', () => {
@@ -2598,6 +2884,7 @@ function initializeYouTubeExtension(): void {
     if (newVideoId !== currentVideoId) {
       resetTranscriptState();
       currentVideoId = newVideoId;
+      resetTranscriptionForVideo(newVideoId);
       if (subtitleObserver) {
         subtitleObserver.disconnect();
       }
@@ -2646,6 +2933,29 @@ chrome.runtime.onMessage.addListener((message: MessageRequest, sender, sendRespo
     
     if (message.type === 'GET_SUBTITLES') {
       console.log('GET_SUBTITLES - checking if we need to extract captions...');
+      lastSubtitlesRequestAtMs = Date.now();
+
+      // No caption track: answer with the transcribed sentences (stored ones need no acceptance).
+      const transcriptionPhase = transcription.phase();
+      if (transcriptionPhase !== 'idle') {
+        syncTranscriptionSentences();
+        maybeAutoAcceptTranscription();
+        const sentences = transcription.sentences();
+        const hasSentences = sentences.length > 0;
+        sendResponse({
+          success: hasSentences,
+          ...(hasSentences ? {} : { error: transcriptionStatusText(transcription.phase()) }),
+          data: {
+            meaningfulSentences: sentences,
+            ...(hasSentences ? { sentences } : {}),
+            subtitles: [],
+            videoId: currentVideoId,
+            captionLanguageCode: activeCaptionLanguageCode,
+            playerLanguageCode: activeCaptionLanguageCode,
+          }
+        } as MessageResponse);
+        return true;
+      }
 
       const requestedVideoId = currentVideoId;
 
@@ -2819,4 +3129,12 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   renderExplainPanel();
   setExplainButtonState();
   renderOverlayLanguagePair();
+});
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== 'sync' || !changes[USER_PREFERENCES_STORAGE_KEY]) return;
+  alwaysTranscribeCaptionless = normalizeStoredUserPreferences(
+    changes[USER_PREFERENCES_STORAGE_KEY].newValue,
+  ).alwaysTranscribeCaptionless;
+  maybeAutoAcceptTranscription();
 });

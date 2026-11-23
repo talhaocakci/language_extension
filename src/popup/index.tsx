@@ -15,6 +15,7 @@ import {
   NETFLIX_AUDIO_EXPERIMENT_ENABLED,
   type NetflixAudioCaptureStatus,
 } from '../experiments/netflix-audio/protocol';
+import { normalizeStoredUserPreferences } from '../types/common';
 import './popup.css';
 
 type AuthState =
@@ -35,6 +36,8 @@ const PopupApp: React.FC = () => {
   const [audioExperimentStatus, setAudioExperimentStatus] = useState<NetflixAudioCaptureStatus | null>(null);
   const [audioExperimentBusy, setAudioExperimentBusy] = useState(false);
   const [audioExperimentMessage, setAudioExperimentMessage] = useState('');
+  const [alwaysTranscribeCaptionless, setAlwaysTranscribeCaptionless] = useState(false);
+  const [settingsMessage, setSettingsMessage] = useState('');
 
   useEffect(() => { void loadAll(); }, []);
   useEffect(() => {
@@ -67,6 +70,10 @@ const PopupApp: React.FC = () => {
           DEFAULT_EXPLANATION_LANGUAGE,
         ));
       }
+      const userPreferencesResp = await chrome.runtime.sendMessage({ type: 'GET_PREFERENCES' }).catch(() => null);
+      setAlwaysTranscribeCaptionless(
+        normalizeStoredUserPreferences(userPreferencesResp?.data).alwaysTranscribeCaptionless,
+      );
       if (NETFLIX_AUDIO_EXPERIMENT_ENABLED) {
         setAudioExperimentStatus(await getNetflixAudioExperimentStatus());
       }
@@ -117,6 +124,27 @@ const PopupApp: React.FC = () => {
       setSaveMessage(`Could not save: ${String(err)}`);
     }
     window.setTimeout(() => setSaveMessage(''), 2200);
+  };
+
+  const handleAlwaysTranscribeChange = async (checked: boolean) => {
+    setAlwaysTranscribeCaptionless(checked);
+    setSettingsMessage('Saving…');
+    try {
+      const resp = await chrome.runtime.sendMessage({
+        type: 'SET_PREFERENCES',
+        payload: { alwaysTranscribeCaptionless: checked },
+      });
+      if (resp?.success) {
+        setSettingsMessage('Saved');
+      } else {
+        setAlwaysTranscribeCaptionless(!checked);
+        setSettingsMessage(resp?.error || 'Could not save');
+      }
+    } catch (err) {
+      setAlwaysTranscribeCaptionless(!checked);
+      setSettingsMessage(`Could not save: ${String(err)}`);
+    }
+    window.setTimeout(() => setSettingsMessage(''), 2200);
   };
 
   const handleSignIn = async () => {
@@ -335,6 +363,18 @@ const PopupApp: React.FC = () => {
                 AI analysis is powered by the backend — no API keys needed here.
                 Just sign in from the Profile tab and the extension handles everything automatically.
               </p>
+            </div>
+            <div className="settingGroup settingCheckbox">
+              <label htmlFor="always-transcribe-captionless">
+                <input
+                  id="always-transcribe-captionless"
+                  type="checkbox"
+                  checked={alwaysTranscribeCaptionless}
+                  onChange={(event) => { void handleAlwaysTranscribeChange(event.target.checked); }}
+                />
+                Always transcribe YouTube videos without captions (uses credits)
+              </label>
+              {settingsMessage && <div className="saveMessage">{settingsMessage}</div>}
             </div>
           </div>
         )}
