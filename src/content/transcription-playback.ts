@@ -1,49 +1,56 @@
 // The single pause/resume around accepting transcription: when the learner
-// accepts while the video plays, it is paused once and resumed on the first
-// change to 'ready' — unless the learner pressed play or pause in between.
+// accepts while the video plays, it is paused once and resumed when the phase
+// leaves 'preparing' (for ready, unavailable, no_credits or signed_out) —
+// unless the learner pressed play or pause in between.
 // Feed it the video's play/pause events; it says when to pause and resume.
+
+/** How long the pause event for our own pause() may take to arrive before a pause counts as the learner's. */
+export const OWN_PAUSE_EVENT_MS = 1000;
+
+const RESUME_PHASES = new Set(['ready', 'unavailable', 'no_credits', 'signed_out']);
 
 export class AcceptPauseTracker {
   private pausedOnce = false;
   private neverPauseAgain = false;
-  private waitingForReady = false;
-  private ownPausePending = false;
+  private waitingForResume = false;
+  private ownPauseAt: number | null = null;
+
+  constructor(private readonly now: () => number = () => Date.now()) {}
 
   reset(): void {
     this.pausedOnce = false;
     this.neverPauseAgain = false;
-    this.waitingForReady = false;
-    this.ownPausePending = false;
+    this.waitingForResume = false;
+    this.ownPauseAt = null;
   }
 
   /** Returns true when the caller should pause the video now. */
   onAccept(isPlaying: boolean, autoAccepted: boolean): boolean {
     if (!isPlaying || autoAccepted || this.pausedOnce || this.neverPauseAgain) return false;
     this.pausedOnce = true;
-    this.waitingForReady = true;
-    this.ownPausePending = true;
+    this.waitingForResume = true;
+    this.ownPauseAt = this.now();
     return true;
   }
 
   onPauseEvent(): void {
-    if (this.ownPausePending) {
-      this.ownPausePending = false; // the pause we asked for
-      return;
-    }
-    this.waitingForReady = false;
+    const own = this.ownPauseAt !== null && this.now() - this.ownPauseAt <= OWN_PAUSE_EVENT_MS;
+    this.ownPauseAt = null;
+    if (own) return; // the pause we asked for
+    this.waitingForResume = false;
   }
 
   onPlayEvent(): void {
-    if (!this.waitingForReady) return;
-    this.waitingForReady = false;
-    this.ownPausePending = false;
+    this.ownPauseAt = null; // a missed pause event for our pause can no longer arrive as ours
+    if (!this.waitingForResume) return;
+    this.waitingForResume = false;
     this.neverPauseAgain = true;
   }
 
   /** Returns true when the caller should resume playback now. */
   onPhase(phase: string): boolean {
-    if (phase !== 'ready' || !this.waitingForReady) return false;
-    this.waitingForReady = false;
+    if (!this.waitingForResume || !RESUME_PHASES.has(phase)) return false;
+    this.waitingForResume = false;
     return true;
   }
 }

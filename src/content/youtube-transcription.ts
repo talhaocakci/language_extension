@@ -24,7 +24,7 @@ export interface TranscriptionDeps {
 export const UNAVAILABLE_AFTER_MS = 8000;
 export const MAX_IN_FLIGHT = 2;
 export const BUSY_RETRY_MS = 3000;
-/** A window sent as the highest listed one is the video's last once nothing higher is listed this long after it was done. */
+/** The highest done window is the video's last once nothing higher is listed this long after it was done. */
 export const LAST_WINDOW_SETTLE_MS = 20_000;
 /** A sentence starting this soon after the playhead counts as covering it. */
 export const COVER_AHEAD_MS = 30_000;
@@ -41,6 +41,8 @@ export class TranscriptionController {
   private acceptedAt = 0;
   private sticky: StickyPhase | null = null;
   private sawWindow = false;
+  /** The learner uses the overlay or side panel for this video; nothing is fetched before. */
+  private wanted = false;
   private stored: Promise<void> | null = null;
   private storedSettled = false;
   private tickingGeneration: number | null = null;
@@ -49,8 +51,8 @@ export class TranscriptionController {
   private done = new Set<number>();
   private inFlight = new Set<number>();
   private busyUntil = new Map<number, number>();
-  /** Windows sent while they were the highest listed, with the time they were done (null while in flight). */
-  private lastCandidates = new Map<number, number | null>();
+  /** When each done window became done (sent, given up, or received as stored), by deps.now(). */
+  private doneAt = new Map<number, number>();
   private lastWindowIndex: number | undefined;
   private detectedLanguage = '';
 
@@ -65,14 +67,14 @@ export class TranscriptionController {
 
   phase(): TranscriptionPhase {
     const s = this.state;
-    if (!s || s.hasCaptions) return 'idle';
+    if (!s || s.hasCaptions || !this.wanted) return 'idle';
     if (this.sticky) return this.sticky;
     if (this.coversPlayhead()) return 'ready';
     return this.accepted ? 'preparing' : 'offer';
   }
 
   sentences(): MeaningfulSentence[] {
-    if (!this.state || this.state.hasCaptions) return NO_SENTENCES;
+    if (!this.state || this.state.hasCaptions || !this.wanted) return NO_SENTENCES;
     if (this.builtVersion !== this.wordsVersion || this.builtLastWindow !== this.lastWindowIndex) {
       this.cached = sentencesFromWindows(this.words, `stt|${this.videoId}`, this.lastWindowIndex);
       this.builtVersion = this.wordsVersion;
@@ -88,7 +90,7 @@ export class TranscriptionController {
 
   /** True when a sentence contains the playhead or starts within 30 s after it, or the playhead's window is done. */
   coversPlayhead(): boolean {
-    if (!this.state || this.state.hasCaptions) return false;
+    if (!this.state || this.state.hasCaptions || !this.wanted) return false;
     const playhead = this.deps.playheadMs();
     if (this.done.has(Math.floor(playhead / WINDOW_MS))) return true;
     return this.sentences().some((s) =>
@@ -97,8 +99,19 @@ export class TranscriptionController {
     );
   }
 
+  /**
+   * The learner shows interest in this video (overlay enabled, or the side panel asked for subtitles).
+   * Until then the phase is idle and nothing is fetched. Once true it stays true until reset.
+   */
+  setWanted(wanted: boolean): void {
+    if (!wanted || this.wanted || !this.videoId) return;
+    this.wanted = true;
+    this.observe();
+    this.emitIfChanged();
+  }
+
   accept(): void {
-    if (!this.videoId || this.accepted) return;
+    if (!this.videoId || !this.wanted || this.accepted) return;
     this.accepted = true;
     this.acceptedAt = this.deps.now();
     this.emitIfChanged();
@@ -112,13 +125,14 @@ export class TranscriptionController {
     this.acceptedAt = 0;
     this.sticky = null;
     this.sawWindow = false;
+    this.wanted = false;
     this.stored = null;
     this.storedSettled = false;
     this.words = new Map();
     this.done = new Set();
     this.inFlight = new Set();
     this.busyUntil = new Map();
-    this.lastCandidates = new Map();
+    this.doneAt = new Map();
     this.lastWindowIndex = undefined;
     this.detectedLanguage = '';
     this.wordsVersion += 1;
@@ -134,19 +148,21 @@ export class TranscriptionController {
     try {
       this.observe();
       const s = this.state;
-      if (!s || s.hasCaptions || s.format !== AUDIO_FORMAT) return;
+      if (!s || s.hasCaptions || !this.wanted) return;
       if (s.windows.length > 0) this.sawWindow = true;
-      this.settleLastWindow(s);
+      this.updateLastWindow();
 
       if (!this.accepted || this.sticky) return;
       if (this.stored && !this.storedSettled) {
         await this.stored;
         if (generation !== this.generation) return;
       }
+      // Runs whatever the format: with no audio format ever detected nothing would end 'preparing'.
       if (!this.sawWindow && !this.coversPlayhead() && this.deps.now() - this.acceptedAt >= UNAVAILABLE_AFTER_MS) {
         this.sticky = 'unavailable';
         return;
       }
+      if (s.format !== AUDIO_FORMAT) return;
       await this.sendWhileRoom(generation);
     } finally {
       if (this.tickingGeneration === generation) this.tickingGeneration = null;
@@ -166,7 +182,7 @@ export class TranscriptionController {
     }
     if (!raw || !this.videoId || raw.videoId !== this.videoId) return;
     this.state = raw;
-    if (raw.hasCaptions) return;
+    if (raw.hasCaptions || !this.wanted) return;
     if (raw.format === 'unsupported' && !this.sticky) this.sticky = 'unavailable';
     if (raw.format === AUDIO_FORMAT && !this.stored) this.stored = this.loadStored(this.generation);
   }
@@ -184,10 +200,11 @@ export class TranscriptionController {
     for (const w of windows) {
       if (!w || !Number.isInteger(w.index) || w.index < 0 || !Array.isArray(w.words)) continue;
       this.words.set(w.index, w.words);
-      this.done.add(w.index);
+      this.markDone(w.index);
       if (!this.detectedLanguage && w.language) this.detectedLanguage = w.language;
     }
     if (windows.length > 0) this.wordsVersion += 1;
+    this.updateLastWindow();
     this.emitIfChanged();
   }
 
@@ -204,7 +221,6 @@ export class TranscriptionController {
       const ready: ReadyWindow[] = s.windows.map((w) => ({ ...w, clusterIndexes: [] }));
       const next = nextWindowToSend(ready, blocked, this.inFlight, this.deps.playheadMs());
       if (!next) return;
-      const highest = Math.max(...s.windows.map((w) => w.index));
       const index = next.index;
 
       this.inFlight.add(index);
@@ -221,11 +237,9 @@ export class TranscriptionController {
       }
       if (file.file.byteLength > MAX_WINDOW_FILE_BYTES) {
         this.inFlight.delete(index);
-        this.done.add(index); // treated as failed: no words, never sent
+        this.markDone(index); // treated as failed: no words, never sent
         continue;
       }
-      if (index >= highest) this.lastCandidates.set(index, null);
-      else this.lastCandidates.delete(index);
       void this.send(generation, {
         videoId: this.videoId,
         format: AUDIO_FORMAT,
@@ -253,42 +267,45 @@ export class TranscriptionController {
       const words = Array.isArray(result.window?.words) ? result.window.words : [];
       this.words.set(index, words);
       this.wordsVersion += 1;
-      this.done.add(index);
+      this.markDone(index);
       if (!this.detectedLanguage && result.window?.language) this.detectedLanguage = result.window.language;
-      if (this.lastCandidates.has(index)) this.lastCandidates.set(index, this.deps.now());
+      this.updateLastWindow();
       return this.emitIfChanged();
     }
     const reason = (result as Extract<TranscribeResult, { ok: false }>).reason;
     if (reason === 'busy') {
       this.busyUntil.set(index, this.deps.now() + BUSY_RETRY_MS);
-      this.lastCandidates.delete(index);
     } else if (reason === 'insufficient_credits') {
       if (!this.sticky) this.sticky = 'no_credits';
-      this.lastCandidates.delete(index);
     } else if (reason === 'not_signed_in') {
       if (!this.sticky) this.sticky = 'signed_out';
-      this.lastCandidates.delete(index);
     } else {
-      this.done.add(index); // failed: given up, never chosen again
-      this.lastCandidates.delete(index);
+      this.markDone(index); // failed: given up, never chosen again
+      this.updateLastWindow();
     }
     this.emitIfChanged();
   }
 
-  /** The bridge lists the final window only once the player has buffered to the end; see LAST_WINDOW_SETTLE_MS. */
-  private settleLastWindow(s: AudioCaptureState): void {
-    if (this.lastWindowIndex !== undefined) return;
-    const highestListed = s.windows.length > 0 ? Math.max(...s.windows.map((w) => w.index)) : -1;
-    const now = this.deps.now();
-    for (const [index, doneAt] of [...this.lastCandidates]) {
-      if (highestListed > index) {
-        this.lastCandidates.delete(index);
-        continue;
-      }
-      if (doneAt !== null && now - doneAt >= LAST_WINDOW_SETTLE_MS) {
-        this.lastWindowIndex = Math.max(this.lastWindowIndex ?? -1, index);
-      }
+  private markDone(index: number): void {
+    this.done.add(index);
+    if (!this.doneAt.has(index)) this.doneAt.set(index, this.deps.now());
+  }
+
+  /**
+   * The bridge lists the final window only once the player has buffered to the end. Re-evaluated each time:
+   * H = the highest done window; it is the last when nothing above H is listed and H has been done for
+   * LAST_WINDOW_SETTLE_MS. A higher window listed or done later withdraws it again.
+   */
+  private updateLastWindow(): void {
+    let next: number | undefined;
+    if (this.done.size > 0) {
+      const highestDone = Math.max(...this.done);
+      const listed = this.state?.windows ?? [];
+      const higherListed = listed.some((w) => w.index > highestDone);
+      const doneAt = this.doneAt.get(highestDone) ?? Number.POSITIVE_INFINITY;
+      if (!higherListed && this.deps.now() - doneAt >= LAST_WINDOW_SETTLE_MS) next = highestDone;
     }
+    this.lastWindowIndex = next; // sentences() rebuilds when this changes; emitIfChanged reports it
   }
 
   private emitIfChanged(): void {

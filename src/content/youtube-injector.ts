@@ -2500,6 +2500,7 @@ function updateYouTubeToggleState(): void {
 
 function setYouTubeOverlayEnabled(enabled: boolean): void {
   overlayEnabled = enabled;
+  if (overlayEnabled) transcription.setWanted(true);
   updateYouTubeToggleState();
   if (overlayEnabled && meaningfulSentences.length === 0) {
     void ensureCaptionsForCurrentVideo();
@@ -2607,14 +2608,12 @@ async function ensureCaptionsForCurrentVideo(force = false): Promise<void> {
 
 const TRANSCRIPT_WINDOWS_TIMEOUT_MS = 15_000;
 const TRANSCRIBE_WINDOW_TIMEOUT_MS = 120_000;
-const SIDE_PANEL_REQUEST_RECENT_MS = 30_000;
 const YT_SIGN_IN_PROMPT = 'Not logged in. Please sign in from the extension popup.';
 
 let alwaysTranscribeCaptionless = false;
 let transcriptionAutoAcceptedVideoId = '';
 let transcriptionAppliedSentences: MeaningfulSentence[] | null = null;
 let transcriptionLastPhase: TranscriptionPhase = 'idle';
-let lastSubtitlesRequestAtMs = 0;
 let transcriptionMediaListenersBound = false;
 const acceptPauseTracker = new AcceptPauseTracker();
 const transcriptionWindowFileEnv = browserWindowFileEnv();
@@ -2684,6 +2683,12 @@ function transcriptionStatusText(phase: TranscriptionPhase): string {
     case 'signed_out': return YT_SIGN_IN_PROMPT;
     default: return 'Preparing subtitles…';
   }
+}
+
+/** GET_SUBTITLES error text: the side panel has no Transcribe button. */
+function transcriptionPanelStatusText(phase: TranscriptionPhase): string {
+  if (phase === 'offer') return 'This video has no captions. Turn on Learn CC on the video to transcribe it.';
+  return transcriptionStatusText(phase);
 }
 
 function shouldShowTranscriptionStatus(phase: TranscriptionPhase): boolean {
@@ -2794,13 +2799,11 @@ function acceptTranscriptionFromOverlay(): void {
   void transcription.tick();
 }
 
-/** "Always transcribe": accept once the video would show the offer, while the overlay or side panel is in use. */
+/** "Always transcribe": accept once the video would show the offer, only while the overlay is enabled. */
 function maybeAutoAcceptTranscription(): void {
-  if (!alwaysTranscribeCaptionless || !currentVideoId) return;
+  if (!alwaysTranscribeCaptionless || !currentVideoId || !overlayEnabled) return;
   if (transcriptionAutoAcceptedVideoId === currentVideoId) return;
   if (transcription.phase() !== 'offer') return;
-  const sidePanelRecent = lastSubtitlesRequestAtMs > 0 && Date.now() - lastSubtitlesRequestAtMs < SIDE_PANEL_REQUEST_RECENT_MS;
-  if (!overlayEnabled && !sidePanelRecent) return;
   transcriptionAutoAcceptedVideoId = currentVideoId;
   acceptPauseTracker.onAccept(false, true); // never pauses
   transcription.accept();
@@ -2826,8 +2829,8 @@ function resetTranscriptionForVideo(videoId: string): void {
   transcriptionAppliedSentences = null;
   transcriptionLastPhase = 'idle';
   transcriptionAutoAcceptedVideoId = '';
-  lastSubtitlesRequestAtMs = 0;
-  transcription.reset(videoId);
+  transcription.reset(videoId); // also forgets that the learner wanted this video
+
 }
 
 function bindTranscriptionMediaListeners(): void {
@@ -2933,9 +2936,9 @@ chrome.runtime.onMessage.addListener((message: MessageRequest, sender, sendRespo
     
     if (message.type === 'GET_SUBTITLES') {
       console.log('GET_SUBTITLES - checking if we need to extract captions...');
-      lastSubtitlesRequestAtMs = Date.now();
 
       // No caption track: answer with the transcribed sentences (stored ones need no acceptance).
+      transcription.setWanted(true);
       const transcriptionPhase = transcription.phase();
       if (transcriptionPhase !== 'idle') {
         syncTranscriptionSentences();
@@ -2944,7 +2947,7 @@ chrome.runtime.onMessage.addListener((message: MessageRequest, sender, sendRespo
         const hasSentences = sentences.length > 0;
         sendResponse({
           success: hasSentences,
-          ...(hasSentences ? {} : { error: transcriptionStatusText(transcription.phase()) }),
+          ...(hasSentences ? {} : { error: transcriptionPanelStatusText(transcription.phase()) }),
           data: {
             meaningfulSentences: sentences,
             ...(hasSentences ? { sentences } : {}),

@@ -9,7 +9,7 @@ import {
   type TranscriptionDeps,
 } from '../src/content/youtube-transcription';
 import { parseAudioWindowAnswer, requestAudioWindowFile, type WindowFileEnv } from '../src/content/audio-window-request';
-import { AcceptPauseTracker } from '../src/content/transcription-playback';
+import { AcceptPauseTracker, OWN_PAUSE_EVENT_MS } from '../src/content/transcription-playback';
 import { MAX_WINDOW_FILE_BYTES, type TranscribeResult, type TranscriptWindow } from '../src/utils/transcript-api';
 import { WINDOW_MS } from '../src/utils/transcription-windows';
 import { AUDIO_WINDOW_MESSAGE, type AudioCaptureState } from '../src/utils/youtube-timedtext';
@@ -128,14 +128,14 @@ const texts = (c: TranscriptionController) => c.sentences().map((s) => s.text);
 
 test('nothing is uploaded before the learner accepts', async () => {
   const f = fake({ windows: [0, 1] }); const c = new TranscriptionController(f.deps, () => {});
-  c.reset('v1'); await c.tick(); await c.tick();
+  c.reset('v1'); c.setWanted(true); await c.tick(); await c.tick();
   assert.equal(c.phase(), 'offer'); assert.equal(f.transcribeCalls.length, 0);
   assert.equal(f.fileRequests.length, 0);
 });
 
 test('stored windows show at once without acceptance or upload', async () => {
   const f = fake({ stored: [win(0, 'Hallo Welt.')], windows: [] }); const c = new TranscriptionController(f.deps, () => {});
-  c.reset('v1'); await f.settled();
+  c.reset('v1'); c.setWanted(true); await f.settled();
   assert.equal(c.phase(), 'ready'); assert.deepEqual(texts(c), ['Hallo Welt.']);
   assert.equal(f.transcribeCalls.length, 0);
   assert.deepEqual(f.fetchStoredCalls, [{ videoId: 'v1', format: 'webm-opus' }]);
@@ -143,7 +143,7 @@ test('stored windows show at once without acceptance or upload', async () => {
 
 test('after accepting, the window at the playhead is sent first and at most two are in flight', async () => {
   const f = fake({ windows: [0, 1, 2, 3], playheadMs: 65_000, hold: true }); const c = new TranscriptionController(f.deps, () => {});
-  c.reset('v1'); c.accept(); await c.tick(); await c.tick(); await c.tick();
+  c.reset('v1'); c.setWanted(true); c.accept(); await c.tick(); await c.tick(); await c.tick();
   assert.deepEqual(f.transcribeCalls.map((r) => r.index), [2, 3]);
   assert.equal(MAX_IN_FLIGHT, 2);
   assert.equal(c.phase(), 'preparing');
@@ -153,19 +153,19 @@ test('after accepting, the window at the playhead is sent first and at most two 
 
 test('a stored window is not uploaded again', async () => {
   const f = fake({ stored: [win(0, 'Eins.')], windows: [0, 1] }); const c = new TranscriptionController(f.deps, () => {});
-  c.reset('v1'); await f.settled(); c.accept(); await c.tick(); await f.settled();
+  c.reset('v1'); c.setWanted(true); await f.settled(); c.accept(); await c.tick(); await f.settled();
   assert.deepEqual(f.transcribeCalls.map((r) => r.index), [1]);
 });
 
 test('a late answer for the previous video is ignored', async () => {
   const f = fake({ windows: [0], hold: true }); const c = new TranscriptionController(f.deps, () => {});
-  c.reset('v1'); c.accept(); await c.tick(); c.reset('v2'); f.release(win(0, 'Alt.')); await f.settled();
+  c.reset('v1'); c.setWanted(true); c.accept(); await c.tick(); c.reset('v2'); f.release(win(0, 'Alt.')); await f.settled();
   assert.deepEqual(c.sentences(), []);
 });
 
 test('a late answer after resetting the same video is ignored', async () => {
   const f = fake({ windows: [0], hold: true }); const c = new TranscriptionController(f.deps, () => {});
-  c.reset('v1'); c.accept(); await c.tick(); c.reset('v1'); f.release(win(0, 'Alt.')); await f.settled();
+  c.reset('v1'); c.setWanted(true); c.accept(); await c.tick(); c.reset('v1'); c.setWanted(true); f.release(win(0, 'Alt.')); await f.settled();
   assert.deepEqual(c.sentences(), []);
   assert.equal(c.phase(), 'offer');
 });
@@ -173,7 +173,7 @@ test('a late answer after resetting the same video is ignored', async () => {
 test('running out of credits stops uploads and keeps what is shown', async () => {
   const f = fake({ windows: [0, 1, 2], answers: [win(0, 'Eins.'), 'insufficient_credits'] });
   const c = new TranscriptionController(f.deps, () => {});
-  c.reset('v1'); c.accept(); for (let i = 0; i < 5; i++) { await c.tick(); await f.settled(); }
+  c.reset('v1'); c.setWanted(true); c.accept(); for (let i = 0; i < 5; i++) { await c.tick(); await f.settled(); }
   assert.equal(c.phase(), 'no_credits'); assert.equal(f.transcribeCalls.length, 2);
   assert.deepEqual(texts(c), ['Eins.']);
 });
@@ -182,19 +182,19 @@ test('a window with no speech does not keep the overlay preparing', async () => 
   // Clarification: the brief's `lastWindow: 1` option is gone; "Jetzt." ends a sentence anyway.
   const f = fake({ windows: [0, 1], answers: [win(0, ''), win(1, 'Jetzt.')] });
   const c = new TranscriptionController(f.deps, () => {});
-  c.reset('v1'); c.accept(); for (let i = 0; i < 4; i++) { await c.tick(); await f.settled(); }
+  c.reset('v1'); c.setWanted(true); c.accept(); for (let i = 0; i < 4; i++) { await c.tick(); await f.settled(); }
   assert.equal(c.phase(), 'ready'); assert.deepEqual(texts(c), ['Jetzt.']);
 });
 
 test('a window that keeps failing is given up, not retried forever', async () => {
   const f = fake({ windows: [0], answers: ['failed', 'failed', 'failed'] }); const c = new TranscriptionController(f.deps, () => {});
-  c.reset('v1'); c.accept(); for (let i = 0; i < 6; i++) { await c.tick(); await f.settled(); }
+  c.reset('v1'); c.setWanted(true); c.accept(); for (let i = 0; i < 6; i++) { await c.tick(); await f.settled(); }
   assert.equal(f.transcribeCalls.length, 1);
 });
 
 test('a busy answer is tried again later, not given up', async () => {
   const f = fake({ windows: [0], answers: ['busy', win(0, 'Jetzt.')], clock: true }); const c = new TranscriptionController(f.deps, () => {});
-  c.reset('v1'); c.accept(); await c.tick(); await f.settled(); await c.tick(); await f.settled();
+  c.reset('v1'); c.setWanted(true); c.accept(); await c.tick(); await f.settled(); await c.tick(); await f.settled();
   assert.equal(f.transcribeCalls.length, 1);
   f.advance(BUSY_RETRY_MS + 1); await c.tick(); await f.settled();
   assert.deepEqual(texts(c), ['Jetzt.']);
@@ -202,20 +202,20 @@ test('a busy answer is tried again later, not given up', async () => {
 
 test('an oversized window file is not uploaded', async () => {
   const f = fake({ windows: [0], fileBytes: MAX_WINDOW_FILE_BYTES + 1 }); const c = new TranscriptionController(f.deps, () => {});
-  c.reset('v1'); c.accept(); await c.tick(); await f.settled(); await c.tick();
+  c.reset('v1'); c.setWanted(true); c.accept(); await c.tick(); await f.settled(); await c.tick();
   assert.equal(f.transcribeCalls.length, 0);
   assert.equal(f.fileRequests.length, 1);
 });
 
 test('no audio after accepting means unavailable', async () => {
   const f = fake({ windows: [], clock: true }); const c = new TranscriptionController(f.deps, () => {});
-  c.reset('v1'); c.accept(); await c.tick(); f.advance(UNAVAILABLE_AFTER_MS + 1); await c.tick();
+  c.reset('v1'); c.setWanted(true); c.accept(); await c.tick(); f.advance(UNAVAILABLE_AFTER_MS + 1); await c.tick();
   assert.equal(c.phase(), 'unavailable');
 });
 
 test('MP4 audio means unavailable at once', async () => {
   const f = fake({ format: 'unsupported' }); const c = new TranscriptionController(f.deps, () => {});
-  c.reset('v1'); c.accept(); await c.tick();
+  c.reset('v1'); c.setWanted(true); c.accept(); await c.tick();
   assert.equal(c.phase(), 'unavailable');
 });
 
@@ -223,14 +223,14 @@ test('MP4 audio means unavailable at once', async () => {
 
 test('MP4 audio means unavailable even before accepting', async () => {
   const f = fake({ format: 'unsupported' }); const c = new TranscriptionController(f.deps, () => {});
-  c.reset('v1');
+  c.reset('v1'); c.setWanted(true);
   assert.equal(c.phase(), 'unavailable');
   assert.equal(f.fetchStoredCalls.length, 0);
 });
 
 test('a captioned video causes no backend call and stays idle', async () => {
   const f = fake({ hasCaptions: true, windows: [0, 1] }); const c = new TranscriptionController(f.deps, () => {});
-  c.reset('v1'); await c.tick(); c.accept(); await c.tick(); await f.settled();
+  c.reset('v1'); c.setWanted(true); await c.tick(); c.accept(); await c.tick(); await f.settled();
   assert.equal(c.phase(), 'idle');
   assert.deepEqual(c.sentences(), []);
   assert.equal(f.fetchStoredCalls.length, 0);
@@ -241,15 +241,49 @@ test('a captioned video causes no backend call and stays idle', async () => {
 test('ticks on a captioned video do not report changes', async () => {
   const f = fake({ hasCaptions: true }); let changes = 0;
   const c = new TranscriptionController(f.deps, () => { changes += 1; });
-  c.reset('v1'); const afterReset = changes;
+  c.reset('v1'); c.setWanted(true); const afterReset = changes;
   for (let i = 0; i < 3; i++) await c.tick();
   assert.equal(changes, afterReset);
   assert.equal(c.sentences(), c.sentences());
 });
 
+test('nothing is fetched and the phase is idle until the video is wanted', async () => {
+  const f = fake({ windows: [0], stored: [win(0, 'Hallo.')] }); const c = new TranscriptionController(f.deps, () => {});
+  c.reset('v1'); await c.tick(); c.accept(); await c.tick(); await f.settled();
+  assert.equal(c.phase(), 'idle');
+  assert.deepEqual(c.sentences(), []);
+  assert.equal(f.fetchStoredCalls.length, 0);
+  assert.equal(f.transcribeCalls.length, 0);
+  c.setWanted(true); await f.settled(); await c.tick(); c.setWanted(true); await f.settled();
+  assert.equal(f.fetchStoredCalls.length, 1);
+  assert.equal(c.phase(), 'ready');
+  c.reset('v1'); await c.tick(); await f.settled();
+  assert.equal(c.phase(), 'idle'); // reset forgets wanted
+  assert.equal(f.fetchStoredCalls.length, 1);
+});
+
+test('a captioned video is never fetched, wanted or not', async () => {
+  const f = fake({ hasCaptions: true }); const c = new TranscriptionController(f.deps, () => {});
+  c.reset('v1'); await c.tick(); c.setWanted(true); await c.tick(); await f.settled();
+  assert.equal(f.fetchStoredCalls.length, 0);
+  assert.equal(c.phase(), 'idle');
+});
+
+test('with no audio format ever detected, accepting ends in unavailable', async () => {
+  const f = fake({ format: '', windows: [], clock: true }); const c = new TranscriptionController(f.deps, () => {});
+  c.reset('v1'); c.setWanted(true); await c.tick();
+  assert.equal(c.phase(), 'offer');
+  c.accept(); await c.tick();
+  assert.equal(c.phase(), 'preparing');
+  f.advance(UNAVAILABLE_AFTER_MS + 1); await c.tick();
+  assert.equal(c.phase(), 'unavailable');
+  assert.equal(f.fetchStoredCalls.length, 0);
+  assert.equal(f.fileRequests.length, 0);
+});
+
 test('stored windows are not fetched before the audio format is known', async () => {
   const f = fake({ format: '' }); const c = new TranscriptionController(f.deps, () => {});
-  c.reset('v1'); await c.tick();
+  c.reset('v1'); c.setWanted(true); await c.tick();
   assert.equal(f.fetchStoredCalls.length, 0);
   f.setState({ videoId: 'v1', hasCaptions: false, format: 'webm-opus', windows: [] });
   await c.tick(); await c.tick(); await f.settled();
@@ -258,7 +292,7 @@ test('stored windows are not fetched before the audio format is known', async ()
 
 test('a state for another video is ignored', async () => {
   const f = fake({ videoId: 'old', windows: [0] }); const c = new TranscriptionController(f.deps, () => {});
-  c.reset('v1'); c.accept(); await c.tick(); await f.settled();
+  c.reset('v1'); c.setWanted(true); c.accept(); await c.tick(); await f.settled();
   assert.equal(c.phase(), 'idle');
   assert.equal(f.fetchStoredCalls.length, 0);
   assert.equal(f.transcribeCalls.length, 0);
@@ -270,7 +304,7 @@ test('a state for another video is ignored', async () => {
 
 test('a null window file is retried on a later tick', async () => {
   const f = fake({ windows: [0], nullFiles: 1 }); const c = new TranscriptionController(f.deps, () => {});
-  c.reset('v1'); c.accept(); await c.tick(); await f.settled();
+  c.reset('v1'); c.setWanted(true); c.accept(); await c.tick(); await f.settled();
   assert.equal(f.transcribeCalls.length, 0);
   assert.equal(c.phase(), 'preparing');
   await c.tick(); await f.settled();
@@ -279,14 +313,14 @@ test('a null window file is retried on a later tick', async () => {
 
 test('a rejected transcribe counts as failed', async () => {
   const f = fake({ windows: [0], transcribeRejects: true }); const c = new TranscriptionController(f.deps, () => {});
-  c.reset('v1'); c.accept(); for (let i = 0; i < 4; i++) { await c.tick(); await f.settled(); }
+  c.reset('v1'); c.setWanted(true); c.accept(); for (let i = 0; i < 4; i++) { await c.tick(); await f.settled(); }
   assert.equal(f.transcribeCalls.length, 1);
   assert.equal(c.phase(), 'ready'); // the playhead's window is done (with no words)
 });
 
 test('a rejected fetchStored does not break the controller', async () => {
   const f = fake({ windows: [0], fetchStoredRejects: true, answers: [win(0, 'Gut.')] }); const c = new TranscriptionController(f.deps, () => {});
-  c.reset('v1'); await f.settled();
+  c.reset('v1'); c.setWanted(true); await f.settled();
   assert.equal(c.phase(), 'offer');
   c.accept(); await c.tick(); await f.settled();
   assert.deepEqual(texts(c), ['Gut.']);
@@ -294,7 +328,7 @@ test('a rejected fetchStored does not break the controller', async () => {
 
 test('a tick that starts while another is awaiting does not double-send', async () => {
   const f = fake({ windows: [0, 1, 2], hold: true, slowFiles: true }); const c = new TranscriptionController(f.deps, () => {});
-  c.reset('v1'); c.accept();
+  c.reset('v1'); c.setWanted(true); c.accept();
   await Promise.all([c.tick(), c.tick(), c.tick()]); await f.settled();
   await Promise.all([c.tick(), c.tick()]); await f.settled();
   const sent = f.transcribeCalls.map((r) => r.index);
@@ -303,7 +337,7 @@ test('a tick that starts while another is awaiting does not double-send', async 
 
 test('not signed in stops uploads with phase signed_out', async () => {
   const f = fake({ windows: [0, 1, 2], answers: ['not_signed_in'] }); const c = new TranscriptionController(f.deps, () => {});
-  c.reset('v1'); c.accept(); await c.tick(); await f.settled();
+  c.reset('v1'); c.setWanted(true); c.accept(); await c.tick(); await f.settled();
   assert.equal(c.phase(), 'signed_out');
   const calls = f.transcribeCalls.length;
   assert.ok(calls >= 1 && calls <= MAX_IN_FLIGHT);
@@ -315,7 +349,7 @@ test('not signed in stops uploads with phase signed_out', async () => {
 test('sentences survive no_credits and still cover the playhead', async () => {
   const f = fake({ windows: [0, 1], answers: [win(0, 'Eins zwei.'), 'insufficient_credits'] });
   const c = new TranscriptionController(f.deps, () => {});
-  c.reset('v1'); c.accept(); for (let i = 0; i < 3; i++) { await c.tick(); await f.settled(); }
+  c.reset('v1'); c.setWanted(true); c.accept(); for (let i = 0; i < 3; i++) { await c.tick(); await f.settled(); }
   assert.equal(c.phase(), 'no_credits');
   assert.deepEqual(texts(c), ['Eins zwei.']);
   f.setPlayhead(1200);
@@ -327,7 +361,7 @@ test('sentences survive no_credits and still cover the playhead', async () => {
 
 test('coverage: a sentence starting within 30 s after the playhead counts, a later one does not', async () => {
   const f = fake({ stored: [win(2, 'Später.')] }); const c = new TranscriptionController(f.deps, () => {});
-  c.reset('v1'); await f.settled();
+  c.reset('v1'); c.setWanted(true); await f.settled();
   f.setPlayhead(61_000 - 30_000); // sentence starts at 61 000
   assert.equal(c.coversPlayhead(), true);
   f.setPlayhead(61_000 - 30_001);
@@ -337,13 +371,13 @@ test('coverage: a sentence starting within 30 s after the playhead counts, a lat
 
 test('busy windows do not block other windows', async () => {
   const f = fake({ windows: [0, 1], answers: ['busy', win(1, 'Zwei.')], clock: true }); const c = new TranscriptionController(f.deps, () => {});
-  c.reset('v1'); c.accept(); await c.tick(); await f.settled(); await c.tick(); await f.settled();
+  c.reset('v1'); c.setWanted(true); c.accept(); await c.tick(); await f.settled(); await c.tick(); await f.settled();
   assert.deepEqual(f.transcribeCalls.map((r) => r.index), [0, 1]);
 });
 
 test('the unavailable clock restarts on accept and stops once a window is listed', async () => {
   const f = fake({ windows: [], clock: true }); const c = new TranscriptionController(f.deps, () => {});
-  c.reset('v1'); await c.tick();
+  c.reset('v1'); c.setWanted(true); await c.tick();
   f.advance(UNAVAILABLE_AFTER_MS + 1); await c.tick();
   assert.equal(c.phase(), 'offer'); // not accepted: no clock
   c.accept(); await c.tick();
@@ -355,7 +389,7 @@ test('the unavailable clock restarts on accept and stops once a window is listed
 
 test('the final unfinished sentence appears once the last window is settled', async () => {
   const f = fake({ windows: [0], answers: [win(0, 'Hallo Welt')], clock: true }); const c = new TranscriptionController(f.deps, () => {});
-  c.reset('v1'); c.accept(); await c.tick(); await f.settled();
+  c.reset('v1'); c.setWanted(true); c.accept(); await c.tick(); await f.settled();
   assert.deepEqual(texts(c), []); // may still continue in a later window
   f.advance(LAST_WINDOW_SETTLE_MS - 1); await c.tick();
   assert.deepEqual(texts(c), []);
@@ -363,21 +397,47 @@ test('the final unfinished sentence appears once the last window is settled', as
   assert.deepEqual(texts(c), ['Hallo Welt']);
 });
 
-test('a later window listed in time means the window was not the last', async () => {
-  const f = fake({ windows: [0], answers: [win(0, 'Hallo Welt')], clock: true }); const c = new TranscriptionController(f.deps, () => {});
-  c.reset('v1'); c.accept(); await c.tick(); await f.settled();
-  f.advance(5000); f.setWindows([0, 1]); await c.tick(); await f.settled();
-  // Window 0 is no longer a candidate; window 1 (no words) was sent as the highest.
-  f.advance(LAST_WINDOW_SETTLE_MS - 5000); await c.tick();
+test('a mid-video settle is withdrawn when later windows arrive, and the real end is found later', async () => {
+  const f = fake({ windows: [0], answers: [win(0, 'Eins zwei'), win(1, ''), win(2, 'Ende hier')], clock: true });
+  const c = new TranscriptionController(f.deps, () => {});
+  c.reset('v1'); c.setWanted(true); c.accept(); await c.tick(); await f.settled();
+  f.advance(LAST_WINDOW_SETTLE_MS + 1); await c.tick();
+  assert.deepEqual(texts(c), ['Eins zwei']); // window 0 looked like the end
+  f.setWindows([0, 1, 2]); await c.tick();
+  assert.deepEqual(texts(c), []); // a higher window is listed: the tail is retracted
+  await f.settled(); await c.tick(); await f.settled();
+  assert.deepEqual(f.transcribeCalls.map((r) => r.index), [0, 1, 2]);
+  assert.deepEqual(texts(c), []); // window 2 just done
+  f.advance(LAST_WINDOW_SETTLE_MS - 1); await c.tick();
   assert.deepEqual(texts(c), []);
+  f.advance(2); await c.tick();
+  assert.deepEqual(texts(c), ['Eins zwei Ende hier']);
+});
+
+test('a window listed above a settled stored end retracts the tail until the run continues', async () => {
+  const f = fake({ stored: [win(0, 'Hallo.'), win(1, 'Ende ohne Punkt')], windows: [], clock: true });
+  const c = new TranscriptionController(f.deps, () => {});
+  c.reset('v1'); c.setWanted(true); await f.settled();
+  assert.deepEqual(texts(c), ['Hallo.']);
   f.advance(LAST_WINDOW_SETTLE_MS); await c.tick();
-  assert.deepEqual(texts(c), ['Hallo Welt']);
-  assert.deepEqual(f.transcribeCalls.map((r) => r.index), [0, 1]);
+  assert.deepEqual(texts(c), ['Hallo.', 'Ende ohne Punkt']); // all from stored windows (reload)
+  f.setWindows([2]); await c.tick();
+  assert.deepEqual(texts(c), ['Hallo.']);
+});
+
+test('changes of the last window are reported', async () => {
+  const f = fake({ stored: [win(0, 'Ende ohne Punkt')], windows: [], clock: true });
+  let changes = 0;
+  const c = new TranscriptionController(f.deps, () => { changes += 1; });
+  c.reset('v1'); c.setWanted(true); await f.settled();
+  const before = changes;
+  f.advance(LAST_WINDOW_SETTLE_MS); await c.tick();
+  assert.ok(changes > before);
 });
 
 test('sentences use the stt track key and keep their array between changes', async () => {
   const f = fake({ stored: [win(0, 'Hallo Welt.')] }); const c = new TranscriptionController(f.deps, () => {});
-  c.reset('v1'); await f.settled();
+  c.reset('v1'); c.setWanted(true); await f.settled();
   const first = c.sentences();
   assert.equal(c.sentences(), first);
   await c.tick();
@@ -390,7 +450,7 @@ test('onChange fires on reset, stored windows, accept and results', async () => 
   const f = fake({ windows: [0], answers: [win(0, 'Gut.')], stored: [] });
   let changes = 0;
   const c = new TranscriptionController(f.deps, () => { changes += 1; });
-  c.reset('v1');
+  c.reset('v1'); c.setWanted(true);
   const afterReset = changes;
   assert.ok(afterReset >= 1);
   await f.settled();
@@ -513,6 +573,47 @@ test('the learner pausing again themself cancels the resume', () => {
   t.onPauseEvent();
   t.onPauseEvent(); // a second pause cannot be ours
   assert.equal(t.onPhase('ready'), false);
+});
+
+function clockTracker() {
+  let t = 0;
+  return { tracker: new AcceptPauseTracker(() => t), advance(ms: number) { t += ms; } };
+}
+
+test('playback resumes when preparing ends in any other phase', () => {
+  for (const phase of ['ready', 'unavailable', 'no_credits', 'signed_out']) {
+    const { tracker } = clockTracker();
+    assert.equal(tracker.onAccept(true, false), true);
+    tracker.onPauseEvent();
+    assert.equal(tracker.onPhase('preparing'), false);
+    assert.equal(tracker.onPhase(phase), true, phase);
+    assert.equal(tracker.onPhase(phase), false, phase);
+  }
+});
+
+test('the own-pause expectation expires after 1000 ms', () => {
+  const { tracker, advance } = clockTracker();
+  assert.equal(tracker.onAccept(true, false), true);
+  advance(OWN_PAUSE_EVENT_MS + 1);
+  tracker.onPauseEvent(); // too late to be ours: the learner paused
+  assert.equal(tracker.onPhase('ready'), false);
+});
+
+test('the own-pause expectation is cleared by the next play event', () => {
+  const { tracker } = clockTracker();
+  assert.equal(tracker.onAccept(true, false), true);
+  tracker.onPlayEvent(); // our pause event never arrived; the learner pressed play
+  tracker.onPauseEvent(); // and then paused: must not count as ours
+  assert.equal(tracker.onPhase('ready'), false);
+  assert.equal(tracker.onAccept(true, false), false);
+});
+
+test('our own pause event within 1000 ms keeps the resume', () => {
+  const { tracker, advance } = clockTracker();
+  assert.equal(tracker.onAccept(true, false), true);
+  advance(OWN_PAUSE_EVENT_MS);
+  tracker.onPauseEvent();
+  assert.equal(tracker.onPhase('ready'), true);
 });
 
 test('reset forgets the previous video', () => {
