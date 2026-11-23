@@ -1,6 +1,6 @@
 import type { SubtitleChunk, MeaningfulSentence } from '../types/subtitle';
 import type { MessageRequest, MessageResponse, PlaybackControlPayload } from '../types/common';
-import { groupAndProcessSubtitles } from '../utils/subtitle-processor';
+import { buildYouTubeSentences } from '../utils/youtube-sentences';
 import {
   CAPTIONS_ON_EVENT,
   PLAYER_TRACK_ATTRIBUTE,
@@ -26,6 +26,8 @@ let overlayRefreshInterval: number | null = null;
 let uiEnsureInterval: number | null = null;
 let captionsRetryTimer: number | null = null;
 let lastSubtitles: SubtitleChunk[] = [];
+// Raw caption response the current cues were parsed from; '' when unknown.
+let lastRawCaptionText = '';
 let allExtractedSubtitles: SubtitleChunk[] = [];
 let meaningfulSentences: MeaningfulSentence[] = [];
 let captionsExtracted = false;
@@ -126,6 +128,7 @@ function resetTranscriptState(): void {
   captionsRetryAttempts = 0;
   captionsCacheVideoId = '';
   lastSubtitles = [];
+  lastRawCaptionText = '';
   allExtractedSubtitles = [];
   activeCaptionLanguageCode = '';
   captionTrackKeyInUse = '';
@@ -828,6 +831,7 @@ async function fetchCaptionsFromCaptionTracksFallback(): Promise<SubtitleChunk[]
 
         const parsed = parseCaptionText(resp.data);
         if (parsed.length > 0) {
+          lastRawCaptionText = resp.data;
           const languageCode = getTrackLanguageCode(track);
           if (languageCode) {
             activeCaptionLanguageCode = languageCode;
@@ -907,6 +911,7 @@ async function fetchCaptionsViaPageScript(): Promise<SubtitleChunk[]> {
   console.log(`✓ Service worker returned ${response.data.length} bytes`);
   const parsed = parseCaptionText(response.data);
   if (parsed.length > 0) {
+    lastRawCaptionText = response.data;
     return parsed;
   }
 
@@ -2515,7 +2520,7 @@ async function ensureCaptionsForCurrentVideo(force = false): Promise<void> {
       return;
     }
 
-    meaningfulSentences = groupAndProcessSubtitles(captions);
+    meaningfulSentences = buildYouTubeSentences(lastRawCaptionText, captions, captionTrackKeyInUse || currentVideoId);
     lastSubtitles = captions;
     captionsExtracted = true;
     captionsCacheVideoId = requestedVideoId;
@@ -2626,6 +2631,7 @@ chrome.runtime.onMessage.addListener((message: MessageRequest, sender, sendRespo
           success: true,
           data: {
             meaningfulSentences: meaningfulSentences,
+            sentences: meaningfulSentences,
             subtitles: lastSubtitles,
             videoId: currentVideoId,
             captionLanguageCode: activeCaptionLanguageCode,
@@ -2688,7 +2694,7 @@ chrome.runtime.onMessage.addListener((message: MessageRequest, sender, sendRespo
             } as MessageResponse);
             return;
           }
-          meaningfulSentences = groupAndProcessSubtitles(captions);
+          meaningfulSentences = buildYouTubeSentences(lastRawCaptionText, captions, captionTrackKeyInUse || currentVideoId);
           lastSubtitles = captions;
           captionsExtracted = true;
           captionsCacheVideoId = requestedVideoId;
@@ -2699,6 +2705,7 @@ chrome.runtime.onMessage.addListener((message: MessageRequest, sender, sendRespo
             success: true,
             data: {
               meaningfulSentences: meaningfulSentences,
+              sentences: meaningfulSentences,
               subtitles: captions,
               videoId: currentVideoId,
               captionLanguageCode: activeCaptionLanguageCode,

@@ -136,6 +136,8 @@ interface WordPopupState {
 
 interface SubtitleResponsePayload {
   meaningfulSentences?: MeaningfulSentence[];
+  // Sentences already shaped by the content script (YouTube only).
+  sentences?: MeaningfulSentence[];
   subtitles?: SubtitleChunk[];
   videoId?: string;
   captionLanguageCode?: string;
@@ -748,17 +750,27 @@ const PanelApp: React.FC = () => {
   }, []);
 
   const loadSentences = useCallback(async (tabId: number): Promise<string | undefined> => {
+    // Shaped sentences from the page are used as-is; otherwise regroup the cues.
+    const applyLoaded = (data: SubtitleResponsePayload) => {
+      if (Array.isArray(data.sentences) && data.sentences.length > 0) {
+        return applySubtitlePayload(
+          { ...data, meaningfulSentences: data.sentences },
+          { skipRefine: true }
+        );
+      }
+      return applySubtitlePayload(data);
+    };
     try {
       const response: any = await chrome.tabs.sendMessage(tabId, { type: 'GET_SUBTITLES' });
       if (response?.success && response.data) {
-        await applySubtitlePayload(response.data as SubtitleResponsePayload);
+        await applyLoaded(response.data as SubtitleResponsePayload);
         return typeof response.data?.videoId === 'string' ? response.data.videoId : undefined;
       }
       if (response?.error === 'Video changed during load') {
         await new Promise((r) => setTimeout(r, 400));
         const retry: any = await chrome.tabs.sendMessage(tabId, { type: 'GET_SUBTITLES' });
         if (retry?.success && retry.data) {
-          await applySubtitlePayload(retry.data as SubtitleResponsePayload);
+          await applyLoaded(retry.data as SubtitleResponsePayload);
           return typeof retry.data?.videoId === 'string' ? retry.data.videoId : undefined;
         }
         setError(retry?.error || response?.error || 'No captions found for this video.');
