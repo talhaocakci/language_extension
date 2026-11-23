@@ -20,7 +20,7 @@ function stripClosers(text: string): string {
   return text.slice(0, end);
 }
 
-function endsSentence(text: string): boolean {
+export function endsSentence(text: string): boolean {
   const core = stripClosers(text);
   if (!core || !SENTENCE_MARKS.has(core[core.length - 1])) return false;
   if (core[core.length - 1] !== '.') return true;
@@ -85,7 +85,7 @@ function splitIndex(run: TimedWord[]): number {
   return best;
 }
 
-function toSentence(run: TimedWord[], trackKey: string): MeaningfulSentence {
+export function toSentence(run: TimedWord[], trackKey: string): MeaningfulSentence {
   const text = run.map((w) => w.text).join(' ');
   const startTime = run[0].startMs;
   const subPortions: SubPortions[] = run.map((w) => ({ text: w.text, startTime: w.startMs, endTime: w.endMs }));
