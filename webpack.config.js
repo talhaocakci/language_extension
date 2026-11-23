@@ -7,6 +7,7 @@ module.exports = {
   entry: {
     'background/service-worker': './src/background/service-worker.ts',
     'content/youtube-injector': './src/content/youtube-injector.ts',
+    'content/youtube-player-bridge': './src/content/youtube-player-bridge.ts',
     'content/netflix-injector': './src/content/netflix-injector.ts',
     'experiments/netflix-audio/offscreen': './src/experiments/netflix-audio/offscreen.ts',
     'panel/index': './src/panel/index.tsx',

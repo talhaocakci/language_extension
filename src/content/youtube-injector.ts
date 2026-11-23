@@ -2,6 +2,14 @@ import type { SubtitleChunk, MeaningfulSentence } from '../types/subtitle';
 import type { MessageRequest, MessageResponse, PlaybackControlPayload } from '../types/common';
 import { groupAndProcessSubtitles } from '../utils/subtitle-processor';
 import {
+  CAPTIONS_ON_EVENT,
+  PLAYER_TRACK_ATTRIBUTE,
+  collectTimedtextUrls,
+  parsePlayerTrackState,
+  playerTrackKey,
+  type PlayerTrackState
+} from '../utils/youtube-timedtext';
+import {
   BROWSER_EXTENSION_PREFERENCES_STORAGE_KEY,
   DEFAULT_EXPLANATION_LANGUAGE,
   detectLanguageCode,
@@ -23,6 +31,8 @@ let meaningfulSentences: MeaningfulSentence[] = [];
 let captionsExtracted = false;
 let captionsRetryAttempts = 0;
 let activeCaptionLanguageCode = '';
+// Player track the loaded captions were requested for; '' when unknown.
+let captionTrackKeyInUse = '';
 // Learning mode is opt-in for each video so ordinary viewing stays untouched.
 let overlayEnabled = false;
 let overlayLoading = false;
@@ -118,6 +128,7 @@ function resetTranscriptState(): void {
   lastSubtitles = [];
   allExtractedSubtitles = [];
   activeCaptionLanguageCode = '';
+  captionTrackKeyInUse = '';
   overlayLastSentenceKey = '';
   overlayLastWordIndex = -1;
   overlayLastSentenceIndex = -1;
@@ -833,14 +844,54 @@ async function fetchCaptionsFromCaptionTracksFallback(): Promise<SubtitleChunk[]
   return [];
 }
 
+function readPlayerTrackForCurrentVideo(): PlayerTrackState | null {
+  const state = parsePlayerTrackState(document.documentElement.getAttribute(PLAYER_TRACK_ATTRIBUTE));
+  return state && state.videoId === currentVideoId ? state : null;
+}
+
+// The player only requests captions once they are switched on, and only it
+// knows which track the viewer chose, so ask the page-world bridge for both.
+async function waitForPlayerTrack(): Promise<PlayerTrackState | null> {
+  document.dispatchEvent(new CustomEvent(CAPTIONS_ON_EVENT));
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    const state = readPlayerTrackForCurrentVideo();
+    if (state) return state;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  return null;
+}
+
+// Reload when the viewer picks another caption track (or translation) in the
+// player; the loaded sentences belong to the previous one.
+function reloadCaptionsIfPlayerTrackChanged(): void {
+  if (!overlayEnabled || !captionsExtracted || overlayLoading) return;
+  const state = readPlayerTrackForCurrentVideo();
+  if (!state || playerTrackKey(state) === captionTrackKeyInUse) return;
+
+  for (const key of Object.keys(sentenceAnalysisCache)) delete sentenceAnalysisCache[key];
+  for (const key of Object.keys(wordMeaningCache)) delete wordMeaningCache[key];
+  captionsRetryAttempts = 0;
+  void ensureCaptionsForCurrentVideo(true);
+}
+
 async function fetchCaptionsViaPageScript(): Promise<SubtitleChunk[]> {
   // The service worker intercepts YouTube's own timedtext request via webRequest
   // (which includes the pot= token) and re-fetches it from the extension context.
   // We just ask it for the result.
+  const track = await waitForPlayerTrack();
+  captionTrackKeyInUse = track ? playerTrackKey(track) : '';
+
   console.log('Requesting captured timedtext from service worker...');
   const response = await chrome.runtime.sendMessage({
     type: 'GET_TRANSCRIPT',
-    payload: { videoId: currentVideoId },
+    payload: {
+      videoId: currentVideoId,
+      track,
+      pageUrls: collectTimedtextUrls(
+        performance.getEntriesByType('resource').map((entry) => entry.name)
+      ),
+    },
   });
 
   if (!response?.success || !response?.data) {
@@ -2254,18 +2305,23 @@ function renderOverlaySentenceText(
   activeWordIndex: number
 ): void {
   sentenceWrap.innerHTML = '';
+  // The wrapper is a flex box (to centre short lines); words placed in it
+  // directly become unwrappable flex items and lose the spaces between them.
+  const line = document.createElement('div');
+  line.style.cssText = 'min-width: 0; max-width: 100%; text-align: center;';
+  sentenceWrap.appendChild(line);
   const parts = sentence.text.match(/(\s+|\S+)/gu) || [sentence.text];
   let wordRun = -1;
 
   for (const part of parts) {
     if (/^\s+$/u.test(part)) {
-      sentenceWrap.appendChild(document.createTextNode(part));
+      line.appendChild(document.createTextNode(part));
       continue;
     }
 
     const clean = part.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
     if (!clean) {
-      sentenceWrap.appendChild(document.createTextNode(part));
+      line.appendChild(document.createTextNode(part));
       continue;
     }
 
@@ -2300,7 +2356,7 @@ function renderOverlaySentenceText(
     span.addEventListener('click', (event) => {
       void handleOverlayWordClick(event as MouseEvent, sentence, part, clean);
     });
-    sentenceWrap.appendChild(span);
+    line.appendChild(span);
   }
 }
 
@@ -2499,6 +2555,7 @@ function initializeYouTubeExtension(): void {
   if (uiEnsureInterval !== null) window.clearInterval(uiEnsureInterval);
   uiEnsureInterval = window.setInterval(() => {
     injectYouTubeToggleButton();
+    reloadCaptionsIfPlayerTrackChanged();
   }, 1200);
 
   window.addEventListener('yt-navigate-finish', () => {

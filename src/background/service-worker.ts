@@ -17,6 +17,7 @@ import {
   stopNetflixAudioExperimentForTab,
 } from '../experiments/netflix-audio/background-controller';
 import { isNetflixOrMaxUrl } from '../experiments/netflix-audio/protocol';
+import { getTimedtextLanguage, pickTimedtextUrl, type TimedtextTrack } from '../utils/youtube-timedtext';
 
 console.log('Service Worker starting...');
 
@@ -202,7 +203,15 @@ async function cognitoLogin(): Promise<{ email: string }> {
 }
 
 // YouTube timedtext URL capture (must exist before tab listeners reference it)
-const capturedTimedtextUrls = new Map<number, string>(); // tabId → url
+const capturedTimedtextUrls = new Map<number, string[]>(); // tabId → urls, oldest first
+const MAX_CAPTURED_TIMEDTEXT_URLS = 30;
+
+async function fetchTimedtextBody(url: string): Promise<string> {
+  const resp = await fetch(url, { credentials: 'omit' });
+  const text = await resp.text();
+  console.log(`GET_TRANSCRIPT: status=${resp.status} length=${text.length}`);
+  return text;
+}
 
 function normalizeApiError(status: number, raw: string): string {
   let message = raw;
@@ -336,13 +345,13 @@ chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
     if (details.tabId >= 0) {
       console.log(`[webRequest] Captured timedtext URL for tab ${details.tabId}`);
-      capturedTimedtextUrls.set(details.tabId, details.url);
+      const urls = capturedTimedtextUrls.get(details.tabId) || [];
+      urls.push(details.url);
+      capturedTimedtextUrls.set(details.tabId, urls.slice(-MAX_CAPTURED_TIMEDTEXT_URLS));
       try {
-        const timedTextUrl = new URL(details.url);
-        const languageCode =
-          timedTextUrl.searchParams.get('tlang') ||
-          timedTextUrl.searchParams.get('lang') ||
-          '';
+        // A translated track says nothing about the language being spoken.
+        const params = new URL(details.url).searchParams;
+        const languageCode = params.get('tlang') ? '' : params.get('lang') || '';
         if (languageCode) {
           void chrome.tabs.sendMessage(details.tabId, {
             type: 'PLAYER_LANGUAGE_CHANGED',
@@ -486,24 +495,32 @@ chrome.runtime.onMessage.addListener((message: MessageRequest, sender, sendRespo
       const tabId: number = sender.tab?.id ?? -1;
       const requestedVideoId = String(message.payload?.videoId || '').trim();
 
+      const pageUrls: string[] = Array.isArray(message.payload?.pageUrls)
+        ? message.payload.pageUrls.filter((u: unknown): u is string => typeof u === 'string')
+        : [];
+
+      const rawTrack = message.payload?.track;
+      const track: TimedtextTrack | null = rawTrack && typeof rawTrack.lang === 'string' && rawTrack.lang
+        ? { lang: rawTrack.lang, kind: String(rawTrack.kind || ''), tlang: String(rawTrack.tlang || '') }
+        : null;
+
       (async () => {
-        // Poll up to 10 s for YouTube's player to make its own timedtext request
-        let url = capturedTimedtextUrls.get(tabId);
-        const belongsToRequestedVideo = (candidate?: string): boolean => {
-          if (!candidate) return false;
-          if (!requestedVideoId) return true;
-          try {
-            return new URL(candidate).searchParams.get('v') === requestedVideoId;
-          } catch {
-            return false;
-          }
-        };
-        for (let i = 0; i < 40 && !belongsToRequestedVideo(url); i++) {
+        // pageUrls come from the page's own resource timings, so requests made
+        // while this worker was asleep still count.
+        const pick = (): string | null => pickTimedtextUrl(
+          [...pageUrls, ...(capturedTimedtextUrls.get(tabId) || [])],
+          requestedVideoId,
+          track,
+        );
+
+        // Poll up to 10 s for the player to make its own timedtext request
+        let url = pick();
+        for (let i = 0; i < 40 && !url; i++) {
           await new Promise(r => setTimeout(r, 250));
-          url = capturedTimedtextUrls.get(tabId);
+          url = pick();
         }
 
-        if (!url || !belongsToRequestedVideo(url)) {
+        if (!url) {
           console.log(`GET_TRANSCRIPT: no timedtext URL captured for tab ${tabId}`);
           sendResponse({ success: false, error: 'timedtext URL not yet captured' });
           return;
@@ -511,19 +528,23 @@ chrome.runtime.onMessage.addListener((message: MessageRequest, sender, sendRespo
 
         console.log(`GET_TRANSCRIPT: fetching captured URL for tab ${tabId}`);
         try {
-          const timedTextUrl = new URL(url);
-          const languageCode =
-            timedTextUrl.searchParams.get('tlang') ||
-            timedTextUrl.searchParams.get('lang') ||
-            '';
-          const resp = await fetch(url, { credentials: 'omit' });
-          const text = await resp.text();
-          console.log(`GET_TRANSCRIPT: status=${resp.status} length=${text.length}`);
-          if (text.length > 100) {
-            sendResponse({ success: true, data: text, languageCode });
-          } else {
-            sendResponse({ success: false, error: `empty response (${text.length} bytes)` });
+          // Without a known player track, a lone translated request is turned
+          // back into the spoken-language track; the same token serves both.
+          const attempts = [url];
+          const untranslated = new URL(url);
+          if (!track && untranslated.searchParams.has('tlang')) {
+            untranslated.searchParams.delete('tlang');
+            attempts.unshift(untranslated.toString());
           }
+
+          for (const attempt of attempts) {
+            const text = await fetchTimedtextBody(attempt);
+            if (text.length > 100) {
+              sendResponse({ success: true, data: text, languageCode: getTimedtextLanguage(attempt) });
+              return;
+            }
+          }
+          sendResponse({ success: false, error: 'empty timedtext response' });
         } catch (err) {
           sendResponse({ success: false, error: String(err) });
         }

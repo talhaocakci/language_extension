@@ -9,7 +9,8 @@
     "type-check": "tsc --noEmit",
     "test:language-preferences": "tsc tests/language-preferences.test.ts src/utils/language-preferences.ts --module commonjs --moduleResolution node --target ES2020 --outDir /tmp/language-extension-language-preference-tests --esModuleInterop --skipLibCheck && node --test /tmp/language-extension-language-preference-tests/tests/language-preferences.test.js",
     "test:subtitle-processor": "tsc tests/subtitle-processor.test.ts src/utils/subtitle-processor.ts src/types/subtitle.ts --module commonjs --moduleResolution node --target ES2020 --outDir /tmp/language-extension-subtitle-processor-tests --esModuleInterop --skipLibCheck && NODE_PATH=./node_modules node --test /tmp/language-extension-subtitle-processor-tests/tests/subtitle-processor.test.js",
-    "test:subtitle-timing": "tsc tests/subtitle-timing.test.ts src/utils/subtitle-timing.ts --module commonjs --moduleResolution node --target ES2020 --outDir /tmp/language-extension-subtitle-timing-tests --esModuleInterop --skipLibCheck && node --test /tmp/language-extension-subtitle-timing-tests/tests/subtitle-timing.test.js"
+    "test:subtitle-timing": "tsc tests/subtitle-timing.test.ts src/utils/subtitle-timing.ts --module commonjs --moduleResolution node --target ES2020 --outDir /tmp/language-extension-subtitle-timing-tests --esModuleInterop --skipLibCheck && node --test /tmp/language-extension-subtitle-timing-tests/tests/subtitle-timing.test.js",
+    "test:youtube-timedtext": "tsc tests/youtube-timedtext.test.ts src/utils/youtube-timedtext.ts --module commonjs --moduleResolution node --target ES2020 --lib ES2020,DOM --outDir /tmp/language-extension-youtube-timedtext-tests --esModuleInterop --skipLibCheck && node --test /tmp/language-extension-youtube-timedtext-tests/tests/youtube-timedtext.test.js"
   },
   "dependencies": {
     "react": "^18.2.0",
