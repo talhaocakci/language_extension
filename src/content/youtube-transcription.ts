@@ -33,8 +33,6 @@ export const BUSY_RETRY_MAX_MS = 30_000;
 export const LAST_WINDOW_SETTLE_MS = 20_000;
 /** A transcribed sentence that ended more than this before the playhead is not shown any more. */
 export const STALE_SENTENCE_MS = 2000;
-/** A sentence starting this soon after the playhead counts as covering it. */
-export const COVER_AHEAD_MS = 30_000;
 
 const AUDIO_FORMAT = 'webm-opus';
 /** Mirrors the overlay's lead: a sentence starting this soon after the playhead counts as started. */
@@ -171,15 +169,15 @@ export class TranscriptionController {
     return this.detectedLanguage;
   }
 
-  /** True when a sentence contains the playhead or starts within 30 s after it, or the playhead's window is done. */
+  /**
+   * True when the playhead's window is done or a sentence contains the playhead. Sentences further on do
+   * not count: while the playhead's own window is missing, the learner is still waiting for it.
+   */
   coversPlayhead(): boolean {
     if (this.blocked()) return false;
     const playhead = this.deps.playheadMs();
     if (this.done.has(Math.floor(playhead / WINDOW_MS))) return true;
-    return this.sentences().some((s) =>
-      (s.startTime <= playhead && playhead <= s.endTime) ||
-      (s.startTime > playhead && s.startTime - playhead <= COVER_AHEAD_MS)
-    );
+    return this.sentences().some((s) => s.startTime <= playhead && playhead <= s.endTime);
   }
 
   /** True when the window holding this position has been transcribed (or was stored). */

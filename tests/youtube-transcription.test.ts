@@ -424,14 +424,17 @@ test('sentences survive no_credits and still cover the playhead', async () => {
   assert.equal(c.phase(), 'no_credits');
 });
 
-test('coverage: a sentence starting within 30 s after the playhead counts, a later one does not', async () => {
+test('coverage: sentences further on do not cover a playhead whose own window is missing', async () => {
   const f = fake({ stored: [win(2, 'Später.')] }); const c = new TranscriptionController(f.deps, () => {});
   c.reset('v1'); c.setActive(true); c.setWanted(true); await f.settled();
-  f.setPlayhead(61_000 - 30_000); // sentence starts at 61 000
-  assert.equal(c.coversPlayhead(), true);
-  f.setPlayhead(61_000 - 30_001);
+  f.setPlayhead(59_000); // the sentence starts at 61 000, two seconds on
   assert.equal(c.coversPlayhead(), false);
   assert.equal(c.phase(), 'offer');
+  c.accept();
+  assert.equal(c.phase(), 'preparing'); // not "ready" with nothing to show
+  f.setPlayhead(60_500);
+  assert.equal(c.coversPlayhead(), true);
+  assert.equal(c.phase(), 'ready');
 });
 
 test('busy windows do not block other windows', async () => {
