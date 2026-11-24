@@ -46,8 +46,8 @@ export function busyRetryDelayMs(busyCount: number): number {
 }
 
 /**
- * The transcribed sentence the overlay shows at the playhead: the latest one that has started (or the
- * first one when none has), or null when that one ended more than STALE_SENTENCE_MS before the playhead.
+ * The transcribed sentence the overlay shows at the playhead: the latest one that has started, or null
+ * when none has or that one ended more than STALE_SENTENCE_MS before the playhead.
  */
 export function pickTranscribedSentence(sentences: MeaningfulSentence[], playheadMs: number): MeaningfulSentence | null {
   if (sentences.length === 0) return null;
@@ -56,6 +56,7 @@ export function pickTranscribedSentence(sentences: MeaningfulSentence[], playhea
     if (sentence.startTime <= playheadMs + SENTENCE_START_LEAD_MS) chosen = sentence;
     else break;
   }
+  if (chosen.startTime > playheadMs + SENTENCE_START_LEAD_MS) return null; // nothing has started yet
   return chosen.endTime < playheadMs - STALE_SENTENCE_MS ? null : chosen;
 }
 const NO_SENTENCES: MeaningfulSentence[] = [];
@@ -103,8 +104,11 @@ export class TranscriptionController {
     const s = this.state;
     if (this.blocked()) return 'idle';
     if (this.sticky) return this.sticky;
-    if (this.coversPlayhead()) return 'ready';
-    return this.accepted ? 'preparing' : 'offer';
+    if (!this.accepted) {
+      // Stored windows further on do not cover a missing window at the playhead: offer to transcribe it.
+      return this.done.has(Math.floor(this.deps.playheadMs() / WINDOW_MS)) ? 'ready' : 'offer';
+    }
+    return this.coversPlayhead() ? 'ready' : 'preparing';
   }
 
   sentences(): MeaningfulSentence[] {

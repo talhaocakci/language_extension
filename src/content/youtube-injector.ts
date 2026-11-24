@@ -21,7 +21,6 @@ import {
 import { bytesToBase64, type TranscribeResult } from '../utils/transcript-api';
 import { TranscriptionController, pickTranscribedSentence, type TranscriptionPhase } from './youtube-transcription';
 import { browserWindowFileEnv, requestAudioWindowFile } from './audio-window-request';
-import { AcceptPauseTracker } from './transcription-playback';
 import {
   BROWSER_EXTENSION_PREFERENCES_STORAGE_KEY,
   DEFAULT_EXPLANATION_LANGUAGE,
@@ -2633,9 +2632,6 @@ const YT_SIGN_IN_PROMPT = 'Not logged in. Please sign in from the extension popu
 let alwaysTranscribeCaptionless = false;
 let transcriptionAutoAcceptedVideoId = '';
 let transcriptionAppliedSentences: MeaningfulSentence[] | null = null;
-let transcriptionLastPhase: TranscriptionPhase = 'idle';
-let transcriptionMediaListenersBound = false;
-const acceptPauseTracker = new AcceptPauseTracker();
 const transcriptionWindowFileEnv = browserWindowFileEnv();
 
 /** Resolves the service worker's answer, or undefined on rejection, no answer, or timeout. */
@@ -2756,7 +2752,9 @@ function syncTranscriptionSentences(): void {
 }
 
 function renderTranscriptionStatus(phase: TranscriptionPhase): void {
-  const key = `transcription|${phase}`;
+  // A paused player stops downloading audio, so nothing can be prepared until it plays.
+  const waitingForPlay = phase === 'preparing' && getVideoElement()?.paused === true;
+  const key = `transcription|${phase}|${waitingForPlay}`;
   if (key === overlayLastSentenceKey && !overlayHidden) {
     const now = performance.now();
     if (now - overlayLastAnchorSyncTimeMs >= 350) {
@@ -2788,7 +2786,9 @@ function renderTranscriptionStatus(phase: TranscriptionPhase): void {
     font-size: clamp(14px, 1.5vw, 19px);
   `;
   const text = document.createElement('div');
-  text.textContent = transcriptionStatusText(phase);
+  text.textContent = waitingForPlay
+    ? 'Press play: subtitles appear a few seconds after the video starts playing.'
+    : transcriptionStatusText(phase);
   if (phase === 'signed_out') text.style.color = '#ffcccb';
   box.appendChild(text);
   if (phase === 'offer') {
@@ -2836,9 +2836,7 @@ function syncTranscribeButton(): void {
 /** The learner prefers a transcription to this video's captions. */
 function replaceCaptionsFromOverlay(): void {
   if (!transcription.canReplaceCaptions()) return;
-  const video = getVideoElement();
-  const playing = !!video && !video.paused && !video.ended;
-  if (video && acceptPauseTracker.onAccept(playing, false)) video.pause();
+  // Playback is left alone: a paused player stops downloading audio, so pausing would stall the first window.
   transcription.replaceCaptions();
   syncTranscribeButton();
   void transcription.tick();
@@ -2846,10 +2844,6 @@ function replaceCaptionsFromOverlay(): void {
 
 function acceptTranscriptionFromOverlay(): void {
   if (transcription.phase() !== 'offer') return;
-  const video = getVideoElement();
-  const playing = !!video && !video.paused && !video.ended;
-  // The only playback control here: one pause, resumed when subtitles are ready.
-  if (video && acceptPauseTracker.onAccept(playing, false)) video.pause();
   transcription.accept();
   void transcription.tick();
 }
@@ -2860,47 +2854,22 @@ function maybeAutoAcceptTranscription(): void {
   if (transcriptionAutoAcceptedVideoId === currentVideoId) return;
   if (transcription.phase() !== 'offer') return;
   transcriptionAutoAcceptedVideoId = currentVideoId;
-  acceptPauseTracker.onAccept(false, true); // never pauses
   transcription.accept();
   void transcription.tick();
 }
 
 function handleTranscriptionChange(): void {
   syncTranscriptionSentences();
-  const phase = transcription.phase();
-  if (phase !== transcriptionLastPhase) {
-    transcriptionLastPhase = phase;
-    if (acceptPauseTracker.onPhase(phase)) resumeAfterAcceptPause();
-  }
   maybeAutoAcceptTranscription();
   renderYouTubeOverlay();
 }
 
-function resumeAfterAcceptPause(): void {
-  const video = getVideoElement();
-  if (video?.paused) void video.play().catch(() => undefined);
-}
-
 function resetTranscriptionForVideo(videoId: string): void {
-  acceptPauseTracker.reset();
   transcriptionAppliedSentences = null;
-  transcriptionLastPhase = 'idle';
   transcriptionAutoAcceptedVideoId = '';
   transcription.reset(videoId); // also forgets that the learner wanted this video
   transcription.setActive(overlayEnabled);
 
-}
-
-function bindTranscriptionMediaListeners(): void {
-  if (transcriptionMediaListenersBound) return;
-  transcriptionMediaListenersBound = true;
-  // Media events do not bubble; listen in the capture phase for whichever <video> the player uses.
-  document.addEventListener('play', (event) => {
-    if (event.target instanceof HTMLVideoElement && event.target === getVideoElement()) acceptPauseTracker.onPlayEvent();
-  }, true);
-  document.addEventListener('pause', (event) => {
-    if (event.target instanceof HTMLVideoElement && event.target === getVideoElement()) acceptPauseTracker.onPauseEvent();
-  }, true);
 }
 
 function loadTranscriptionPreferences(): void {
@@ -2921,7 +2890,6 @@ function initializeYouTubeExtension(): void {
   console.log('Initializing Subtitle Learning Extension for YouTube video:', currentVideoId);
 
   bindOverlayShortcutListeners();
-  bindTranscriptionMediaListeners();
   loadTranscriptionPreferences();
   resetTranscriptionForVideo(currentVideoId);
   injectYouTubeToggleButton();
@@ -2938,7 +2906,6 @@ function initializeYouTubeExtension(): void {
     reloadCaptionsIfPlayerTrackChanged();
     void transcription.tick();
     maybeAutoAcceptTranscription();
-    if (acceptPauseTracker.onPoll(transcription.phase())) resumeAfterAcceptPause(); // accept-pause cap
   }, 1200);
 
   window.addEventListener('yt-navigate-finish', () => {

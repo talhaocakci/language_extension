@@ -13,7 +13,6 @@ import {
   type TranscriptionDeps,
 } from '../src/content/youtube-transcription';
 import { parseAudioWindowAnswer, requestAudioWindowFile, type WindowFileEnv } from '../src/content/audio-window-request';
-import { ACCEPT_PAUSE_MAX_MS, AcceptPauseTracker, OWN_PAUSE_EVENT_MS } from '../src/content/transcription-playback';
 import type { MeaningfulSentence } from '../src/types/subtitle';
 import { MAX_WINDOW_FILE_BYTES, type TranscribeResult, type TranscriptWindow } from '../src/utils/transcript-api';
 import { WINDOW_MS } from '../src/utils/transcription-windows';
@@ -246,6 +245,24 @@ test('a captioned video causes no backend call and stays idle', async () => {
   assert.equal(f.fetchStoredCalls.length, 0);
   assert.equal(f.transcribeCalls.length, 0);
   assert.equal(f.fileRequests.length, 0);
+});
+
+test('stored windows further on do not hide a missing window at the playhead: it is offered', async () => {
+  const f = fake({ windows: [0, 1], stored: [win(1, 'Später Text.')], playheadMs: 5000, answers: [win(0, 'Erster Satz.')] });
+  const c = new TranscriptionController(f.deps, () => {});
+  c.reset('v1'); c.setActive(true); c.setWanted(true); await c.tick(); await f.settled();
+  assert.equal(c.phase(), 'offer');
+  c.accept(); await c.tick(); await f.settled(); await c.tick();
+  assert.deepEqual(f.transcribeCalls.map((r) => r.index), [0]);
+  assert.equal(c.phase(), 'ready');
+});
+
+test('a stored window at the playhead is ready without accepting', async () => {
+  const f = fake({ windows: [0, 1], stored: [win(0, 'Erster Satz.')], playheadMs: 5000 });
+  const c = new TranscriptionController(f.deps, () => {});
+  c.reset('v1'); c.setActive(true); c.setWanted(true); await c.tick(); await f.settled();
+  assert.equal(c.phase(), 'ready');
+  assert.equal(f.transcribeCalls.length, 0);
 });
 
 test('captions can be replaced: the video is then transcribed like a captionless one', async () => {
@@ -653,38 +670,7 @@ test('pickTranscribedSentence shows the current sentence and drops one that ende
   assert.equal(pickTranscribedSentence(list, 9900), list[1]); // starts within the lead
   assert.equal(pickTranscribedSentence(list, 12_000), list[1]);
   assert.equal(pickTranscribedSentence(list, 5 * 60_000), null);
-  assert.equal(pickTranscribedSentence(list, 0), list[0]); // nothing started yet: the first
-});
-
-test('the accept-pause is resumed once after 30 s still preparing, and never paused again', () => {
-  const { tracker, advance } = clockTracker();
-  assert.equal(tracker.onAccept(true, false), true);
-  tracker.onPauseEvent();
-  advance(ACCEPT_PAUSE_MAX_MS - 1);
-  assert.equal(tracker.onPoll('preparing'), false);
-  advance(1);
-  assert.equal(tracker.onPoll('ready'), false); // only while preparing
-  assert.equal(tracker.onPoll('preparing'), true);
-  assert.equal(tracker.onPoll('preparing'), false);
-  assert.equal(tracker.onPhase('ready'), false);
-  assert.equal(tracker.onAccept(true, false), false);
-});
-
-test('the 30 s resume does not happen when the learner pressed play or pause, or we never paused', () => {
-  const a = clockTracker();
-  assert.equal(a.tracker.onAccept(true, false), true);
-  a.tracker.onPauseEvent(); a.tracker.onPlayEvent();
-  a.advance(ACCEPT_PAUSE_MAX_MS * 2);
-  assert.equal(a.tracker.onPoll('preparing'), false);
-  const b = clockTracker();
-  assert.equal(b.tracker.onAccept(true, false), true);
-  b.tracker.onPauseEvent(); b.tracker.onPauseEvent();
-  b.advance(ACCEPT_PAUSE_MAX_MS * 2);
-  assert.equal(b.tracker.onPoll('preparing'), false);
-  const d = clockTracker();
-  assert.equal(d.tracker.onAccept(false, false), false);
-  d.advance(ACCEPT_PAUSE_MAX_MS * 2);
-  assert.equal(d.tracker.onPoll('preparing'), false);
+  assert.equal(pickTranscribedSentence(list, 0), null); // nothing started yet
 });
 
 // ── Window file request ──────────────────────────────────────────────────────
@@ -762,86 +748,3 @@ test('parseAudioWindowAnswer ignores unrelated messages', () => {
 
 // ── Pause / resume bookkeeping ───────────────────────────────────────────────
 
-test('accepting while playing pauses once and resumes on the first ready', () => {
-  const t = new AcceptPauseTracker();
-  assert.equal(t.onAccept(true, false), true);
-  t.onPauseEvent(); // our own pause
-  assert.equal(t.onPhase('preparing'), false);
-  assert.equal(t.onPhase('ready'), true);
-  assert.equal(t.onPhase('ready'), false);
-  assert.equal(t.onAccept(true, false), false);
-});
-
-test('accepting while paused or by the always setting never pauses', () => {
-  const t = new AcceptPauseTracker();
-  assert.equal(t.onAccept(false, false), false);
-  assert.equal(t.onPhase('ready'), false);
-  const t2 = new AcceptPauseTracker();
-  assert.equal(t2.onAccept(true, true), false);
-  assert.equal(t2.onPhase('ready'), false);
-});
-
-test('the learner pressing play while preparing cancels the resume and any later pause', () => {
-  const t = new AcceptPauseTracker();
-  assert.equal(t.onAccept(true, false), true);
-  t.onPauseEvent();
-  t.onPlayEvent();
-  assert.equal(t.onPhase('ready'), false);
-  assert.equal(t.onAccept(true, false), false);
-});
-
-test('the learner pausing again themself cancels the resume', () => {
-  const t = new AcceptPauseTracker();
-  assert.equal(t.onAccept(true, false), true);
-  t.onPauseEvent();
-  t.onPauseEvent(); // a second pause cannot be ours
-  assert.equal(t.onPhase('ready'), false);
-});
-
-function clockTracker() {
-  let t = 0;
-  return { tracker: new AcceptPauseTracker(() => t), advance(ms: number) { t += ms; } };
-}
-
-test('playback resumes when preparing ends in any other phase', () => {
-  for (const phase of ['ready', 'unavailable', 'no_credits', 'signed_out']) {
-    const { tracker } = clockTracker();
-    assert.equal(tracker.onAccept(true, false), true);
-    tracker.onPauseEvent();
-    assert.equal(tracker.onPhase('preparing'), false);
-    assert.equal(tracker.onPhase(phase), true, phase);
-    assert.equal(tracker.onPhase(phase), false, phase);
-  }
-});
-
-test('the own-pause expectation expires after 1000 ms', () => {
-  const { tracker, advance } = clockTracker();
-  assert.equal(tracker.onAccept(true, false), true);
-  advance(OWN_PAUSE_EVENT_MS + 1);
-  tracker.onPauseEvent(); // too late to be ours: the learner paused
-  assert.equal(tracker.onPhase('ready'), false);
-});
-
-test('the own-pause expectation is cleared by the next play event', () => {
-  const { tracker } = clockTracker();
-  assert.equal(tracker.onAccept(true, false), true);
-  tracker.onPlayEvent(); // our pause event never arrived; the learner pressed play
-  tracker.onPauseEvent(); // and then paused: must not count as ours
-  assert.equal(tracker.onPhase('ready'), false);
-  assert.equal(tracker.onAccept(true, false), false);
-});
-
-test('our own pause event within 1000 ms keeps the resume', () => {
-  const { tracker, advance } = clockTracker();
-  assert.equal(tracker.onAccept(true, false), true);
-  advance(OWN_PAUSE_EVENT_MS);
-  tracker.onPauseEvent();
-  assert.equal(tracker.onPhase('ready'), true);
-});
-
-test('reset forgets the previous video', () => {
-  const t = new AcceptPauseTracker();
-  t.onAccept(true, false); t.onPauseEvent(); t.onPlayEvent();
-  t.reset();
-  assert.equal(t.onAccept(true, false), true);
-});
