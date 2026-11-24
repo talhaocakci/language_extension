@@ -248,6 +248,41 @@ test('a captioned video causes no backend call and stays idle', async () => {
   assert.equal(f.fileRequests.length, 0);
 });
 
+test('captions can be replaced: the video is then transcribed like a captionless one', async () => {
+  const f = fake({ hasCaptions: true, windows: [0], answers: [win(0, 'Guten Tag.')] }); let changes = 0;
+  const c = new TranscriptionController(f.deps, () => { changes += 1; });
+  c.reset('v1'); c.setActive(true); c.setWanted(true); await c.tick();
+  assert.equal(c.canReplaceCaptions(), true);
+  c.accept(); await c.tick(); await f.settled();
+  assert.equal(c.phase(), 'idle'); // a plain accept never replaces captions
+  assert.equal(f.transcribeCalls.length, 0);
+  const before = changes;
+  c.replaceCaptions();
+  assert.equal(c.phase(), 'preparing');
+  assert.ok(changes > before);
+  assert.equal(c.canReplaceCaptions(), false);
+  await c.tick(); await f.settled(); await c.tick();
+  assert.equal(f.transcribeCalls.length, 1);
+  assert.equal(c.phase(), 'ready');
+  assert.equal(c.sentences().length, 1);
+  c.reset('v1'); c.setWanted(true); await c.tick();
+  assert.equal(c.phase(), 'idle'); // the choice does not survive a reset
+});
+
+test('captions cannot be replaced before the video is wanted, on a captionless video, or without opus audio', async () => {
+  const unwanted = fake({ hasCaptions: true }); const a = new TranscriptionController(unwanted.deps, () => {});
+  a.reset('v1'); await a.tick(); a.replaceCaptions();
+  assert.equal(a.canReplaceCaptions(), false);
+  assert.equal(a.phase(), 'idle');
+  const plain = fake({}); const b = new TranscriptionController(plain.deps, () => {});
+  b.reset('v1'); b.setWanted(true); await b.tick();
+  assert.equal(b.canReplaceCaptions(), false);
+  const other = fake({ hasCaptions: true, format: 'unsupported' }); const d = new TranscriptionController(other.deps, () => {});
+  d.reset('v1'); d.setWanted(true); await d.tick(); d.replaceCaptions();
+  assert.equal(d.canReplaceCaptions(), false);
+  assert.equal(d.phase(), 'idle');
+});
+
 test('ticks on a captioned video do not report changes', async () => {
   const f = fake({ hasCaptions: true }); let changes = 0;
   const c = new TranscriptionController(f.deps, () => { changes += 1; });

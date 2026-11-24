@@ -73,6 +73,8 @@ export class TranscriptionController {
   private wanted = false;
   /** The overlay is on: only then are window files requested and uploaded. */
   private active = false;
+  /** The learner asked for transcription although the video has captions; until reset. */
+  private forced = false;
   private stored: Promise<void> | null = null;
   private storedSettled = false;
   private tickingGeneration: number | null = null;
@@ -99,14 +101,14 @@ export class TranscriptionController {
 
   phase(): TranscriptionPhase {
     const s = this.state;
-    if (!s || s.hasCaptions || !this.wanted) return 'idle';
+    if (this.blocked()) return 'idle';
     if (this.sticky) return this.sticky;
     if (this.coversPlayhead()) return 'ready';
     return this.accepted ? 'preparing' : 'offer';
   }
 
   sentences(): MeaningfulSentence[] {
-    if (!this.state || this.state.hasCaptions || !this.wanted) return NO_SENTENCES;
+    if (this.blocked()) return NO_SENTENCES;
     if (this.builtVersion !== this.wordsVersion || this.builtLastWindow !== this.lastWindowIndex) {
       this.cached = sentencesFromWindows(this.words, `stt|${this.videoId}`, this.lastWindowIndex);
       this.builtVersion = this.wordsVersion;
@@ -122,7 +124,7 @@ export class TranscriptionController {
 
   /** True when a sentence contains the playhead or starts within 30 s after it, or the playhead's window is done. */
   coversPlayhead(): boolean {
-    if (!this.state || this.state.hasCaptions || !this.wanted) return false;
+    if (this.blocked()) return false;
     const playhead = this.deps.playheadMs();
     if (this.done.has(Math.floor(playhead / WINDOW_MS))) return true;
     return this.sentences().some((s) =>
@@ -159,8 +161,24 @@ export class TranscriptionController {
     this.emitIfChanged();
   }
 
+  /** True when the video has captions the learner could replace with a transcription. */
+  canReplaceCaptions(): boolean {
+    const s = this.state;
+    return !!s && this.wanted && s.hasCaptions && !this.forced && s.format === AUDIO_FORMAT;
+  }
+
+  /** The learner chose transcription over the video's captions: from now on it is treated as caption-less, and accepted. */
+  replaceCaptions(): void {
+    if (!this.canReplaceCaptions()) return;
+    this.forced = true;
+    this.observe();
+    this.accept();
+    this.emitIfChanged();
+  }
+
   accept(): void {
     if (!this.videoId || !this.wanted || this.accepted) return;
+    if (this.state?.hasCaptions && !this.forced) return; // captions are replaced only through replaceCaptions()
     this.accepted = true;
     this.acceptedAt = this.deps.now();
     this.emitIfChanged();
@@ -176,6 +194,7 @@ export class TranscriptionController {
     this.sawWindow = false;
     this.wanted = false;
     this.active = false;
+    this.forced = false;
     this.stored = null;
     this.storedSettled = false;
     this.words = new Map();
@@ -199,7 +218,7 @@ export class TranscriptionController {
     try {
       this.observe();
       const s = this.state;
-      if (!s || s.hasCaptions || !this.wanted) return;
+      if (!s || this.blocked()) return;
       // Audio is arriving: a window or a kept cluster stops the unavailable clock for good.
       if (s.windows.length > 0 || typeof s.capturedMs === 'number') this.sawWindow = true;
       this.updateLastWindow();
@@ -224,6 +243,11 @@ export class TranscriptionController {
 
   // ── internals ──────────────────────────────────────────────────────────────
 
+  /** Nothing to do for this video: no state yet, not wanted, or it has captions the learner did not replace. */
+  private blocked(): boolean {
+    return !this.state || !this.wanted || (this.state.hasCaptions && !this.forced);
+  }
+
   /** Reads the bridge state; only a state for this video counts. */
   private observe(): void {
     let raw: AudioCaptureState | null = null;
@@ -234,7 +258,7 @@ export class TranscriptionController {
     }
     if (!raw || !this.videoId || raw.videoId !== this.videoId) return;
     this.state = raw;
-    if (raw.hasCaptions || !this.wanted) return;
+    if (this.blocked()) return;
     if (raw.format === 'unsupported' && !this.sticky) this.sticky = 'unavailable';
     if (raw.format === AUDIO_FORMAT && !this.stored) this.stored = this.loadStored(this.generation);
   }

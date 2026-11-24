@@ -281,10 +281,10 @@ test('a stale player response for the previous video changes nothing and is not 
   assert.equal(decideAudioSync(null, { videoId: 'B', generation: 0, responseVideoId: null, captionTrackCount: 0 }).setEnabled, null);
 });
 
-test('a captioned video disables and resets, a captionless one enables', () => {
+test('audio is kept for a captioned video as for a captionless one', () => {
   const same = { videoId: 'B', generation: 2 };
   const captioned = decideAudioSync(same, { ...same, responseVideoId: 'B', captionTrackCount: 2 });
-  assert.deepEqual(captioned, { resetCapture: true, setEnabled: false, known: true, hasCaptions: true, live: false });
+  assert.deepEqual(captioned, { resetCapture: false, setEnabled: true, known: true, hasCaptions: true, live: false });
   const plain = decideAudioSync(same, { ...same, ...noCaptions });
   assert.deepEqual(plain, { resetCapture: false, setEnabled: true, known: true, hasCaptions: false, live: false });
 });

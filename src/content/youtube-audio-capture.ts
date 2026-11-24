@@ -77,7 +77,8 @@ export function decideAudioSync(prev: AudioSyncPrevious | null, now: AudioSyncNo
   if (!known) return { resetCapture: sameBufferNewVideo, setEnabled: null, known: false, hasCaptions: false, live: false };
   const hasCaptions = now.captionTrackCount > 0;
   const live = now.live === true;
-  const keep = !hasCaptions && !live;
+  // Audio is kept for captioned videos too: the learner may replace poor captions with a transcription.
+  const keep = !live;
   return { resetCapture: sameBufferNewVideo || !keep, setEnabled: keep, known: true, hasCaptions, live };
 }
 

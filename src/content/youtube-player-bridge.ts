@@ -110,7 +110,7 @@ function readAudioState(): string {
     const sync = syncAudio(player);
     if (!sync || !sync.known) return '';
 
-    const keeps = !sync.hasCaptions && !sync.live;
+    const keeps = !sync.live;
     const endMs = keeps ? videoEndMs(player) : undefined;
     const state: AudioCaptureState = {
       videoId: sync.videoId,

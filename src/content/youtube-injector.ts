@@ -114,6 +114,7 @@ interface WordPopupState {
 }
 
 const YT_OVERLAY_ID = 'yt-subtitle-learning-overlay';
+const YT_TRANSCRIBE_BUTTON_CLASS = 'sl-yt-overlay-transcribe-btn';
 const YT_TOGGLE_BTN_ID = 'yt-subtitle-learning-toggle';
 const YT_WORD_POPUP_ID = 'yt-subtitle-learning-word-popup';
 const YT_TARGET_LANGUAGE_VALUE_ID = 'sl-yt-overlay-target-language';
@@ -2066,6 +2067,16 @@ function ensureYouTubeOverlay(): HTMLDivElement {
   });
   controls.appendChild(explainBtn);
 
+  const transcribeBtn = createToolbarButton('🎙 Transcribe', 'Replace the captions with a transcription of the audio. Uses credits.');
+  transcribeBtn.className = YT_TRANSCRIBE_BUTTON_CLASS;
+  transcribeBtn.style.display = 'none';
+  transcribeBtn.addEventListener('click', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    replaceCaptionsFromOverlay();
+  });
+  controls.appendChild(transcribeBtn);
+
   const helpBtn = createToolbarButton('?', 'Keyboard shortcuts');
   helpBtn.addEventListener('click', (event) => {
     event.preventDefault();
@@ -2409,6 +2420,7 @@ function renderYouTubeOverlay(): void {
     hideYouTubeOverlay();
     return;
   }
+  syncTranscribeButton();
 
   const videoElement = getVideoElement();
   if (videoElement?.seeking) {
@@ -2811,6 +2823,25 @@ function renderTranscriptionStatus(phase: TranscriptionPhase): void {
   overlayLastSentenceKey = key;
   overlayLastWordIndex = -1;
   overlayLastSentenceIndex = -1;
+}
+
+/** The toolbar's Transcribe button shows only while the video has captions that a transcription could replace. */
+function syncTranscribeButton(): void {
+  const button = document.querySelector(`#${YT_OVERLAY_ID} .${YT_TRANSCRIBE_BUTTON_CLASS}`) as HTMLButtonElement | null;
+  if (!button) return;
+  const display = transcription.canReplaceCaptions() ? '' : 'none';
+  if (button.style.display !== display) button.style.display = display;
+}
+
+/** The learner prefers a transcription to this video's captions. */
+function replaceCaptionsFromOverlay(): void {
+  if (!transcription.canReplaceCaptions()) return;
+  const video = getVideoElement();
+  const playing = !!video && !video.paused && !video.ended;
+  if (video && acceptPauseTracker.onAccept(playing, false)) video.pause();
+  transcription.replaceCaptions();
+  syncTranscribeButton();
+  void transcription.tick();
 }
 
 function acceptTranscriptionFromOverlay(): void {
