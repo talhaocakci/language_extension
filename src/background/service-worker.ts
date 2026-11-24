@@ -22,7 +22,7 @@ import {
   stopNetflixAudioExperimentForTab,
 } from '../experiments/netflix-audio/background-controller';
 import { isNetflixOrMaxUrl } from '../experiments/netflix-audio/protocol';
-import { parseTranscribeResponse, parseWindowsResponse, shouldRetryTranscribe } from '../utils/transcript-api';
+import { parseTranscribeResponse, parseWindowsResponse, shouldRetryAttempt } from '../utils/transcript-api';
 import { getTimedtextLanguage, pickTimedtextUrl, type TimedtextTrack } from '../utils/youtube-timedtext';
 
 console.log('Service Worker starting...');
@@ -711,7 +711,8 @@ chrome.runtime.onMessage.addListener((message: MessageRequest, sender, sendRespo
             }
           };
           let result = await post();
-          if (!result || shouldRetryTranscribe(result.status, result.json)) {
+          // A partial window is not sent again when the server may already have transcribed (and charged) it.
+          if (shouldRetryAttempt(partial, result ? result.status : null, result ? result.json : null)) {
             await new Promise((r) => setTimeout(r, 1000));
             result = await post();
           }

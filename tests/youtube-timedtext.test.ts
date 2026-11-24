@@ -115,8 +115,17 @@ test('audio capture state survives a round trip', () => {
     hasCaptions: false,
     format: 'webm-opus' as const,
     windows: [{ index: 0, startMs: 0, partial: false }, { index: 3, startMs: 90001, partial: true }],
+    capturedMs: 120001,
+    endCaptured: true,
   };
   assert.deepEqual(parseAudioCaptureState(JSON.stringify(state)), state);
+  const none = { ...state, capturedMs: null, endCaptured: false };
+  assert.deepEqual(parseAudioCaptureState(JSON.stringify(none)), none);
+});
+
+test('an audio capture state from an older bridge has no captured audio and no end', () => {
+  const parsed = parseAudioCaptureState('{"videoId":"a","hasCaptions":false,"format":"webm-opus","windows":[]}');
+  assert.deepEqual(parsed, { videoId: 'a', hasCaptions: false, format: 'webm-opus', windows: [], capturedMs: null, endCaptured: false });
 });
 
 test('junk audio capture state is rejected', () => {
@@ -124,4 +133,7 @@ test('junk audio capture state is rejected', () => {
   assert.equal(parseAudioCaptureState('not json'), null);
   assert.equal(parseAudioCaptureState('{"videoId":"a","hasCaptions":false,"format":"mp3","windows":[]}'), null);
   assert.equal(parseAudioCaptureState('{"videoId":"a","hasCaptions":false,"format":"","windows":[{"index":"x"}]}'), null);
+  assert.equal(parseAudioCaptureState('{"videoId":"a","hasCaptions":false,"format":"","windows":[],"capturedMs":"5"}'), null);
+  assert.equal(parseAudioCaptureState('{"videoId":"a","hasCaptions":false,"format":"","windows":[],"capturedMs":-1}'), null);
+  assert.equal(parseAudioCaptureState('{"videoId":"a","hasCaptions":false,"format":"","windows":[],"endCaptured":1}'), null);
 });

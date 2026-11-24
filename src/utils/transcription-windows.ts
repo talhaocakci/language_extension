@@ -26,10 +26,13 @@ function medianSpacing(times: number[]): number {
 
 /**
  * Windows that can be sent now. videoEndMs: pass when the stream's end has been captured.
+ * pendingClusterMs: timecode of a cluster that has started arriving but is not complete. It is only
+ * evidence that a later cluster exists (it can make a window ready and is "the cluster after the last
+ * one" for the gap check); it is never part of clusterIndexes. Ignored unless later than every cluster.
  * Clusters may come in any order and repeat; invalid timecodes are ignored and clusterIndexes
  * refer to positions in the input (first occurrence of a repeated timecode).
  */
-export function readyWindows(clusters: ClusterTime[], videoEndMs?: number): ReadyWindow[] {
+export function readyWindows(clusters: ClusterTime[], videoEndMs?: number, pendingClusterMs?: number): ReadyWindow[] {
   const sorted: { t: number; pos: number }[] = [];
   clusters.forEach((cluster, pos) => {
     const t = cluster?.timecodeMs;
@@ -48,11 +51,17 @@ export function readyWindows(clusters: ClusterTime[], videoEndMs?: number): Read
   if (groups.size === 0) return [];
 
   const maxIndex = Math.max(...groups.keys());
+  const lastT = unique[unique.length - 1].t;
+  const pending =
+    typeof pendingClusterMs === 'number' && Number.isFinite(pendingClusterMs) && pendingClusterMs > lastT
+      ? pendingClusterMs
+      : undefined;
+  const pendingStartsLaterWindow = pending !== undefined && windowOf(pending) > maxIndex;
   const maxGap = GAP_FACTOR * medianSpacing(unique.map((entry) => entry.t));
   const result: ReadyWindow[] = [];
 
   for (const index of [...groups.keys()].sort((a, b) => a - b)) {
-    const isLast = index === maxIndex;
+    const isLast = index === maxIndex && !pendingStartsLaterWindow;
     if (isLast && videoEndMs === undefined) continue;
 
     const members = groups.get(index)!;
@@ -66,14 +75,20 @@ export function readyWindows(clusters: ClusterTime[], videoEndMs?: number): Read
     }
     if (!partial) {
       if (isLast) partial = (videoEndMs as number) - last > maxGap;
-      else partial = unique[lastPos + 1].t - last > maxGap;
+      else {
+        const nextT = lastPos + 1 < unique.length ? unique[lastPos + 1].t : (pending as number);
+        partial = nextT - last > maxGap;
+      }
     }
     result.push({ index, startMs: first, partial, clusterIndexes: members.map((m) => unique[m].pos) });
   }
   return result;
 }
 
-/** Which window to send next: nearest at or after the playhead, not stored, not in flight. */
+/**
+ * Which window to send next: the nearest at or after the playhead's window, not stored, not in flight.
+ * Never a window before the playhead's window: credits are not spent on audio already played.
+ */
 export function nextWindowToSend(
   ready: ReadyWindow[],
   done: Set<number>,
@@ -81,11 +96,10 @@ export function nextWindowToSend(
   playheadMs: number
 ): ReadyWindow | null {
   const playheadIndex = Math.floor(playheadMs / WINDOW_MS);
-  const open = ready.filter((w) => !done.has(w.index) && !inFlight.has(w.index));
-  const ahead = open.filter((w) => w.index >= playheadIndex).sort((a, b) => a.index - b.index);
-  if (ahead.length > 0) return ahead[0];
-  const behind = open.filter((w) => w.index < playheadIndex).sort((a, b) => b.index - a.index);
-  return behind[0] ?? null;
+  const ahead = ready
+    .filter((w) => w.index >= playheadIndex && !done.has(w.index) && !inFlight.has(w.index))
+    .sort((a, b) => a.index - b.index);
+  return ahead[0] ?? null;
 }
 
 /** Sentences over contiguous windows. The last, unfinished sentence of a run is held back unless final. */

@@ -23,13 +23,41 @@ export interface TranscriptionDeps {
 
 export const UNAVAILABLE_AFTER_MS = 8000;
 export const MAX_IN_FLIGHT = 2;
+/** First wait after a busy answer; doubled for each further busy answer for that window, up to BUSY_RETRY_MAX_MS. */
 export const BUSY_RETRY_MS = 3000;
-/** The highest done window is the video's last once nothing higher is listed this long after it was done. */
+export const BUSY_RETRY_MAX_MS = 30_000;
+/**
+ * Stored-only (the bridge lists no windows): the highest done window is the video's last once it has
+ * been done this long.
+ */
 export const LAST_WINDOW_SETTLE_MS = 20_000;
+/** A transcribed sentence that ended more than this before the playhead is not shown any more. */
+export const STALE_SENTENCE_MS = 2000;
 /** A sentence starting this soon after the playhead counts as covering it. */
 export const COVER_AHEAD_MS = 30_000;
 
 const AUDIO_FORMAT = 'webm-opus';
+/** Mirrors the overlay's lead: a sentence starting this soon after the playhead counts as started. */
+const SENTENCE_START_LEAD_MS = 120;
+
+/** Wait before sending a window again after its n-th busy answer in a row (n >= 1). */
+export function busyRetryDelayMs(busyCount: number): number {
+  return Math.min(BUSY_RETRY_MS * 2 ** Math.max(0, busyCount - 1), BUSY_RETRY_MAX_MS);
+}
+
+/**
+ * The transcribed sentence the overlay shows at the playhead: the latest one that has started (or the
+ * first one when none has), or null when that one ended more than STALE_SENTENCE_MS before the playhead.
+ */
+export function pickTranscribedSentence(sentences: MeaningfulSentence[], playheadMs: number): MeaningfulSentence | null {
+  if (sentences.length === 0) return null;
+  let chosen = sentences[0];
+  for (const sentence of sentences) {
+    if (sentence.startTime <= playheadMs + SENTENCE_START_LEAD_MS) chosen = sentence;
+    else break;
+  }
+  return chosen.endTime < playheadMs - STALE_SENTENCE_MS ? null : chosen;
+}
 const NO_SENTENCES: MeaningfulSentence[] = [];
 type StickyPhase = 'unavailable' | 'no_credits' | 'signed_out';
 
@@ -43,6 +71,8 @@ export class TranscriptionController {
   private sawWindow = false;
   /** The learner uses the overlay or side panel for this video; nothing is fetched before. */
   private wanted = false;
+  /** The overlay is on: only then are window files requested and uploaded. */
+  private active = false;
   private stored: Promise<void> | null = null;
   private storedSettled = false;
   private tickingGeneration: number | null = null;
@@ -51,6 +81,8 @@ export class TranscriptionController {
   private done = new Set<number>();
   private inFlight = new Set<number>();
   private busyUntil = new Map<number, number>();
+  /** Busy answers in a row per window; cleared when it succeeds. */
+  private busyCount = new Map<number, number>();
   /** When each done window became done (sent, given up, or received as stored), by deps.now(). */
   private doneAt = new Map<number, number>();
   private lastWindowIndex: number | undefined;
@@ -110,6 +142,23 @@ export class TranscriptionController {
     this.emitIfChanged();
   }
 
+  /**
+   * The overlay is on (true) or off (false). While inactive no window file is requested and nothing is
+   * uploaded; answers already in flight are still taken. reset() makes it inactive.
+   */
+  setActive(active: boolean): void {
+    this.active = active;
+  }
+
+  /**
+   * After no_credits or signed_out: try uploading again (acceptance stays). Other phases are unchanged.
+   */
+  retry(): void {
+    if (this.sticky !== 'no_credits' && this.sticky !== 'signed_out') return;
+    this.sticky = null;
+    this.emitIfChanged();
+  }
+
   accept(): void {
     if (!this.videoId || !this.wanted || this.accepted) return;
     this.accepted = true;
@@ -126,12 +175,14 @@ export class TranscriptionController {
     this.sticky = null;
     this.sawWindow = false;
     this.wanted = false;
+    this.active = false;
     this.stored = null;
     this.storedSettled = false;
     this.words = new Map();
     this.done = new Set();
     this.inFlight = new Set();
     this.busyUntil = new Map();
+    this.busyCount = new Map();
     this.doneAt = new Map();
     this.lastWindowIndex = undefined;
     this.detectedLanguage = '';
@@ -149,7 +200,8 @@ export class TranscriptionController {
       this.observe();
       const s = this.state;
       if (!s || s.hasCaptions || !this.wanted) return;
-      if (s.windows.length > 0) this.sawWindow = true;
+      // Audio is arriving: a window or a kept cluster stops the unavailable clock for good.
+      if (s.windows.length > 0 || typeof s.capturedMs === 'number') this.sawWindow = true;
       this.updateLastWindow();
 
       if (!this.accepted || this.sticky) return;
@@ -162,7 +214,7 @@ export class TranscriptionController {
         this.sticky = 'unavailable';
         return;
       }
-      if (s.format !== AUDIO_FORMAT) return;
+      if (s.format !== AUDIO_FORMAT || !this.active) return;
       await this.sendWhileRoom(generation);
     } finally {
       if (this.tickingGeneration === generation) this.tickingGeneration = null;
@@ -211,7 +263,7 @@ export class TranscriptionController {
   private async sendWhileRoom(generation: number): Promise<void> {
     while (this.inFlight.size < MAX_IN_FLIGHT) {
       const s = this.state;
-      if (!s || generation !== this.generation || !this.accepted || this.sticky) return;
+      if (!s || generation !== this.generation || !this.accepted || this.sticky || !this.active) return;
       const now = this.deps.now();
       const blocked = new Set(this.done);
       for (const [index, until] of this.busyUntil) {
@@ -231,7 +283,7 @@ export class TranscriptionController {
         file = null;
       }
       if (generation !== this.generation) return;
-      if (!file || !this.accepted || this.sticky) {
+      if (!file || !this.accepted || this.sticky || !this.active) {
         this.inFlight.delete(index); // eligible again on a later tick
         return;
       }
@@ -267,6 +319,7 @@ export class TranscriptionController {
       const words = Array.isArray(result.window?.words) ? result.window.words : [];
       this.words.set(index, words);
       this.wordsVersion += 1;
+      this.busyCount.delete(index);
       this.markDone(index);
       if (!this.detectedLanguage && result.window?.language) this.detectedLanguage = result.window.language;
       this.updateLastWindow();
@@ -274,7 +327,9 @@ export class TranscriptionController {
     }
     const reason = (result as Extract<TranscribeResult, { ok: false }>).reason;
     if (reason === 'busy') {
-      this.busyUntil.set(index, this.deps.now() + BUSY_RETRY_MS);
+      const count = (this.busyCount.get(index) ?? 0) + 1;
+      this.busyCount.set(index, count);
+      this.busyUntil.set(index, this.deps.now() + busyRetryDelayMs(count));
     } else if (reason === 'insufficient_credits') {
       if (!this.sticky) this.sticky = 'no_credits';
     } else if (reason === 'not_signed_in') {
@@ -292,18 +347,22 @@ export class TranscriptionController {
   }
 
   /**
-   * The bridge lists the final window only once the player has buffered to the end. Re-evaluated each time:
-   * H = the highest done window; it is the last when nothing above H is listed and H has been done for
-   * LAST_WINDOW_SETTLE_MS. A higher window listed or done later withdraws it again.
+   * Which window is the video's last, re-evaluated each time:
+   * - the bridge lists windows and its audio reaches the video's end: the highest listed window (its
+   *   final sentence shows once that window is done; until then the tail is held back);
+   * - the bridge lists no windows (stored windows only, e.g. after a reload): the highest done window,
+   *   once it has been done for LAST_WINDOW_SETTLE_MS;
+   * - otherwise none.
    */
   private updateLastWindow(): void {
     let next: number | undefined;
-    if (this.done.size > 0) {
+    const listed = this.state?.windows ?? [];
+    if (listed.length > 0) {
+      if (this.state?.endCaptured) next = Math.max(...listed.map((w) => w.index));
+    } else if (this.done.size > 0) {
       const highestDone = Math.max(...this.done);
-      const listed = this.state?.windows ?? [];
-      const higherListed = listed.some((w) => w.index > highestDone);
       const doneAt = this.doneAt.get(highestDone) ?? Number.POSITIVE_INFINITY;
-      if (!higherListed && this.deps.now() - doneAt >= LAST_WINDOW_SETTLE_MS) next = highestDone;
+      if (this.deps.now() - doneAt >= LAST_WINDOW_SETTLE_MS) next = highestDone;
     }
     this.lastWindowIndex = next; // sentences() rebuilds when this changes; emitIfChanged reports it
   }

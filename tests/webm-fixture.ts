@@ -14,12 +14,28 @@ function filler(length: number): Uint8Array {
   return new Uint8Array(length).fill(0x55);
 }
 
-/** EBML header + Segment (unknown size) + a 20-byte Info + a 30-byte Tracks. */
-export function init(): Uint8Array {
+/** Duration element `44 89 88 <float64>` (11 bytes). */
+export function durationElement(ms: number): Uint8Array {
+  const out = new Uint8Array(11);
+  out.set([0x44, 0x89, 0x88]);
+  new DataView(out.buffer).setFloat64(3, ms);
+  return out;
+}
+
+export const FIXTURE_DURATION_MS = 600_000;
+
+/**
+ * EBML header + Segment (unknown size) + a 20-byte Info + a 30-byte Tracks. The Info holds a Duration
+ * (FIXTURE_DURATION_MS) and a 4-byte Void, or with `withDuration: false` a 15-byte Void only.
+ */
+export function init(withDuration = true): Uint8Array {
+  const info = withDuration
+    ? concat(durationElement(FIXTURE_DURATION_MS), new Uint8Array([0xec, 0x82, 0x00, 0x00]))
+    : concat(new Uint8Array([0xec, 0x8d]), new Uint8Array(13));
   return concat(
     new Uint8Array([0x1a, 0x45, 0xdf, 0xa3, 0x84, 0x42, 0x82, 0x80, 0x00]),
     new Uint8Array([0x18, 0x53, 0x80, 0x67, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
-    new Uint8Array([0x15, 0x49, 0xa9, 0x66, 0x8f]), filler(15),
+    new Uint8Array([0x15, 0x49, 0xa9, 0x66, 0x8f]), info,
     new Uint8Array([0x16, 0x54, 0xae, 0x6b, 0x99]), filler(25),
   );
 }

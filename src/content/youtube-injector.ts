@@ -19,7 +19,7 @@ import {
   type PlayerTrackState
 } from '../utils/youtube-timedtext';
 import { bytesToBase64, type TranscribeResult } from '../utils/transcript-api';
-import { TranscriptionController, type TranscriptionPhase } from './youtube-transcription';
+import { TranscriptionController, pickTranscribedSentence, type TranscriptionPhase } from './youtube-transcription';
 import { browserWindowFileEnv, requestAudioWindowFile } from './audio-window-request';
 import { AcceptPauseTracker } from './transcription-playback';
 import {
@@ -174,6 +174,7 @@ function resetTranscriptState(): void {
   for (const key of Object.keys(overlaySaveError)) delete overlaySaveError[key];
   for (const key of Object.keys(wordMeaningCache)) delete wordMeaningCache[key];
   overlayEnabled = false;
+  transcription.setActive(false);
   updateYouTubeToggleState();
   hideYouTubeOverlay();
   renderOverlayWordPopup();
@@ -2432,8 +2433,14 @@ function renderYouTubeOverlay(): void {
     }
   }
 
-  const target = getOverlayTargetSentence(currentTimeMs);
+  const target = transcriptionPhase !== 'idle'
+    ? getTranscribedTargetSentence(currentTimeMs)
+    : getOverlayTargetSentence(currentTimeMs);
   if (!target) {
+    if (transcriptionPhase !== 'idle' && transcriptionPhase !== 'ready' && transcriptionPhase !== 'offer') {
+      renderTranscriptionStatus(transcriptionPhase); // nothing near the playhead: say why
+      return;
+    }
     hideYouTubeOverlay();
     return;
   }
@@ -2501,6 +2508,7 @@ function updateYouTubeToggleState(): void {
 function setYouTubeOverlayEnabled(enabled: boolean): void {
   overlayEnabled = enabled;
   if (overlayEnabled) transcription.setWanted(true);
+  transcription.setActive(overlayEnabled);
   updateYouTubeToggleState();
   if (overlayEnabled && meaningfulSentences.length === 0) {
     void ensureCaptionsForCurrentVideo();
@@ -2691,6 +2699,12 @@ function transcriptionPanelStatusText(phase: TranscriptionPhase): string {
   return transcriptionStatusText(phase);
 }
 
+/** Transcription mode: the sentence at the playhead, never one that ended long before it. */
+function getTranscribedTargetSentence(currentTimeMs: number): { sentence: MeaningfulSentence; index: number } | null {
+  const sentence = pickTranscribedSentence(meaningfulSentences, currentTimeMs);
+  return sentence ? { sentence, index: meaningfulSentences.indexOf(sentence) } : null;
+}
+
 function shouldShowTranscriptionStatus(phase: TranscriptionPhase): boolean {
   if (phase === 'idle' || phase === 'ready') return false;
   if (phase === 'offer' || phase === 'preparing') return true;
@@ -2774,6 +2788,16 @@ function renderTranscriptionStatus(phase: TranscriptionPhase): void {
     });
     box.appendChild(button);
   }
+  if (phase === 'no_credits' || phase === 'signed_out') {
+    const button = createOverlayToolbarButton('Try again', 'Try transcribing again');
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      transcription.retry();
+      void transcription.tick();
+    });
+    box.appendChild(button);
+  }
   sentenceWrap.appendChild(box);
 
   renderOverlayLanguagePair();
@@ -2815,13 +2839,15 @@ function handleTranscriptionChange(): void {
   const phase = transcription.phase();
   if (phase !== transcriptionLastPhase) {
     transcriptionLastPhase = phase;
-    if (acceptPauseTracker.onPhase(phase)) {
-      const video = getVideoElement();
-      if (video?.paused) void video.play().catch(() => undefined);
-    }
+    if (acceptPauseTracker.onPhase(phase)) resumeAfterAcceptPause();
   }
   maybeAutoAcceptTranscription();
   renderYouTubeOverlay();
+}
+
+function resumeAfterAcceptPause(): void {
+  const video = getVideoElement();
+  if (video?.paused) void video.play().catch(() => undefined);
 }
 
 function resetTranscriptionForVideo(videoId: string): void {
@@ -2830,6 +2856,7 @@ function resetTranscriptionForVideo(videoId: string): void {
   transcriptionLastPhase = 'idle';
   transcriptionAutoAcceptedVideoId = '';
   transcription.reset(videoId); // also forgets that the learner wanted this video
+  transcription.setActive(overlayEnabled);
 
 }
 
@@ -2880,6 +2907,7 @@ function initializeYouTubeExtension(): void {
     reloadCaptionsIfPlayerTrackChanged();
     void transcription.tick();
     maybeAutoAcceptTranscription();
+    if (acceptPauseTracker.onPoll(transcription.phase())) resumeAfterAcceptPause(); // accept-pause cap
   }, 1200);
 
   window.addEventListener('yt-navigate-finish', () => {

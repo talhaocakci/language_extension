@@ -4,6 +4,7 @@ import {
   bytesToBase64,
   parseTranscribeResponse,
   parseWindowsResponse,
+  shouldRetryAttempt,
   shouldRetryTranscribe
 } from '../src/utils/transcript-api';
 
@@ -39,4 +40,27 @@ test('retry only for transient failures', () => {
   assert.equal(shouldRetryTranscribe(503, { error: 'server_busy' }), false);
   assert.equal(shouldRetryTranscribe(503, { error: 'window_busy' }), false);
   for (const s of [200, 400, 401, 402, 413]) assert.equal(shouldRetryTranscribe(s, {}), false);
+});
+
+test('a lost response is retried for a complete window only', () => {
+  assert.equal(shouldRetryAttempt(false, null, null), true);
+  assert.equal(shouldRetryAttempt(true, null, null), false);
+});
+
+test('a partial window is retried only when the server certainly did not transcribe it', () => {
+  assert.equal(shouldRetryAttempt(true, 502, { error: 'transcription_failed' }), true);
+  assert.equal(shouldRetryAttempt(true, 500, { error: 'internal_error' }), false);
+  assert.equal(shouldRetryAttempt(true, 503, { error: 'charge_failed' }), false);
+  assert.equal(shouldRetryAttempt(true, 502, null), false);
+  assert.equal(shouldRetryAttempt(true, 504, {}), false);
+  for (const s of [200, 400, 401, 402, 413]) assert.equal(shouldRetryAttempt(true, s, {}), false);
+  assert.equal(shouldRetryAttempt(true, 503, { error: 'server_busy' }), false);
+});
+
+test('a complete window keeps the transient-failure retry', () => {
+  assert.equal(shouldRetryAttempt(false, 500, { error: 'internal_error' }), true);
+  assert.equal(shouldRetryAttempt(false, 503, { error: 'charge_failed' }), true);
+  assert.equal(shouldRetryAttempt(false, 502, { error: 'transcription_failed' }), true);
+  assert.equal(shouldRetryAttempt(false, 503, { error: 'window_busy' }), false);
+  for (const s of [200, 400, 401, 402, 413]) assert.equal(shouldRetryAttempt(false, s, {}), false);
 });

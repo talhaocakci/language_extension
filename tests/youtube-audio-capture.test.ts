@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { MAX_KEPT_BYTES, decideAudioSync, installAudioCapture } from '../src/content/youtube-audio-capture';
+import { MAX_KEPT_BYTES, decideAudioSync, installAudioCapture, isLiveVideo } from '../src/content/youtube-audio-capture';
 import type { AudioCaptureOptions } from '../src/content/youtube-audio-capture';
 import { parseWebmAudio } from '../src/utils/webm-audio';
 import { cluster, concat, init } from './webm-fixture';
@@ -268,7 +268,7 @@ const noCaptions = { responseVideoId: 'B', captionTrackCount: 0 };
 
 test('navigation to a new video with a new audio buffer does not reset', () => {
   const d = decideAudioSync(A, { videoId: 'B', generation: 2, ...noCaptions });
-  assert.deepEqual(d, { resetCapture: false, setEnabled: true, known: true, hasCaptions: false });
+  assert.deepEqual(d, { resetCapture: false, setEnabled: true, known: true, hasCaptions: false, live: false });
 });
 
 test('navigation to a new video on the same audio buffer resets', () => {
@@ -277,14 +277,63 @@ test('navigation to a new video on the same audio buffer resets', () => {
 
 test('a stale player response for the previous video changes nothing and is not published', () => {
   const d = decideAudioSync(A, { videoId: 'B', generation: 2, responseVideoId: 'A', captionTrackCount: 3 });
-  assert.deepEqual(d, { resetCapture: false, setEnabled: null, known: false, hasCaptions: false });
+  assert.deepEqual(d, { resetCapture: false, setEnabled: null, known: false, hasCaptions: false, live: false });
   assert.equal(decideAudioSync(null, { videoId: 'B', generation: 0, responseVideoId: null, captionTrackCount: 0 }).setEnabled, null);
 });
 
 test('a captioned video disables and resets, a captionless one enables', () => {
   const same = { videoId: 'B', generation: 2 };
   const captioned = decideAudioSync(same, { ...same, responseVideoId: 'B', captionTrackCount: 2 });
-  assert.deepEqual(captioned, { resetCapture: true, setEnabled: false, known: true, hasCaptions: true });
+  assert.deepEqual(captioned, { resetCapture: true, setEnabled: false, known: true, hasCaptions: true, live: false });
   const plain = decideAudioSync(same, { ...same, ...noCaptions });
-  assert.deepEqual(plain, { resetCapture: false, setEnabled: true, known: true, hasCaptions: false });
+  assert.deepEqual(plain, { resetCapture: false, setEnabled: true, known: true, hasCaptions: false, live: false });
+});
+
+test('a live video disables and resets the capture', () => {
+  const same = { videoId: 'B', generation: 2 };
+  const d = decideAudioSync(same, { ...same, ...noCaptions, live: true });
+  assert.deepEqual(d, { resetCapture: true, setEnabled: false, known: true, hasCaptions: false, live: true });
+});
+
+test('isLiveVideo: live now, or live content without a duration', () => {
+  assert.equal(isLiveVideo({ isLive: true, lengthSeconds: '0' }), true);
+  assert.equal(isLiveVideo({ isLive: true, isLiveContent: true, lengthSeconds: '3600' }), true);
+  assert.equal(isLiveVideo({ isLiveContent: true, lengthSeconds: '0' }), true);
+  assert.equal(isLiveVideo({ isLiveContent: true }), true);
+  assert.equal(isLiveVideo({ isLiveContent: true, lengthSeconds: '5400' }), false); // a finished stream's replay
+  assert.equal(isLiveVideo({ isLiveContent: false, lengthSeconds: '0' }), false);
+  assert.equal(isLiveVideo({ lengthSeconds: '120' }), false);
+  assert.equal(isLiveVideo(null), false);
+  assert.equal(isLiveVideo('x'), false);
+});
+
+test('a cluster still arriving makes the window before it ready, without being part of it', () => {
+  const { ms, capture } = setup();
+  const audio = ms.addSourceBuffer(OPUS);
+  audio.appendBuffer(concat(init(), cluster(0, 50), cluster(10001, 50), cluster(20001, 50), cluster(30001, 50).slice(0, 10)));
+  assert.equal(capture.pendingClusterMs(), null); // the Timecode is not in yet
+  assert.deepEqual(capture.windows(), []);
+  audio.appendBuffer(cluster(30001, 50).slice(10, 30));
+  assert.equal(capture.pendingClusterMs(), 30001);
+  assert.equal(capture.lastClusterMs(), 20001);
+  assert.deepEqual(capture.windows().map(w => [w.index, w.partial, w.clusterIndexes]), [[0, false, [0, 1, 2]]]);
+  assert.deepEqual(parseWebmAudio(capture.windowFile(0)!)!.clusters.map(c => c.timecodeMs), [0, 10001, 20001]);
+  audio.abort();
+  assert.equal(capture.pendingClusterMs(), null);
+});
+
+test('a cluster arriving after a gap makes the window partial', () => {
+  const { ms, capture } = setup();
+  const audio = ms.addSourceBuffer(OPUS);
+  audio.appendBuffer(concat(init(), cluster(0, 50), cluster(10001, 50), cluster(20001, 50), cluster(40001, 50).slice(0, 30)));
+  assert.deepEqual(capture.windows().map(w => [w.index, w.partial]), [[0, true]]);
+});
+
+test('no pending cluster while disabled', () => {
+  const { ms, capture } = setup();
+  const audio = ms.addSourceBuffer(OPUS);
+  audio.appendBuffer(concat(init(), cluster(0, 50), cluster(10001, 50).slice(0, 30)));
+  assert.equal(capture.pendingClusterMs(), 10001);
+  capture.setEnabled(false);
+  assert.equal(capture.pendingClusterMs(), null);
 });

@@ -18,6 +18,9 @@ const EBML_ID = [0x1a, 0x45, 0xdf, 0xa3];
 const SEGMENT_ID = [0x18, 0x53, 0x80, 0x67];
 const CLUSTER_ID = [0x1f, 0x43, 0xb6, 0x75];
 const TIMECODE_ID = 0xe7;
+const INFO_ID = 0x1549a966;
+const DURATION_ID = 0x4489;
+const VOID_ID = 0xec;
 
 function hasBytes(bytes: Uint8Array, at: number, id: number[]): boolean {
   if (at < 0 || at + id.length > bytes.length) return false;
@@ -93,6 +96,58 @@ function findInitLength(bytes: Uint8Array): number | null {
   return null;
 }
 
+/**
+ * Timecode of the cluster whose header starts at `at`, when its id, size and Timecode element are
+ * already present; the rest of the cluster may still be missing. null otherwise.
+ */
+export function clusterTimecodeAt(bytes: Uint8Array, at = 0): number | null {
+  return readCluster(bytes, at)?.timecodeMs ?? null;
+}
+
+/** Offset of the Segment's data (its first child) inside the init part, or null. */
+function segmentDataStart(bytes: Uint8Array): number | null {
+  if (!hasBytes(bytes, 0, EBML_ID)) return null;
+  const headerSize = readSize(bytes, 4);
+  if (!headerSize || headerSize.value < 0) return null;
+  const pos = 4 + headerSize.length + headerSize.value;
+  if (!hasBytes(bytes, pos, SEGMENT_ID)) return null;
+  const segSize = readSize(bytes, pos + 4);
+  if (!segSize) return null;
+  return pos + 4 + segSize.length;
+}
+
+/** Offset and total length of the Segment Info's Duration element inside bytes[0, end), or null. */
+function findDuration(bytes: Uint8Array, end: number): { offset: number; length: number } | null {
+  const start = segmentDataStart(bytes);
+  if (start === null) return null;
+  let pos: number = start;
+  while (pos < end) {
+    const id = readId(bytes, pos);
+    if (!id) return null;
+    const size = readSize(bytes, pos + id.length);
+    if (!size || size.value < 0) return null;
+    const dataStart = pos + id.length + size.length;
+    const elementEnd = dataStart + size.value;
+    if (elementEnd > end) return null;
+    if (id.id === INFO_ID) {
+      let child = dataStart;
+      while (child < elementEnd) {
+        const cId = readId(bytes, child);
+        if (!cId) return null;
+        const cSize = readSize(bytes, child + cId.length);
+        if (!cSize || cSize.value < 0) return null;
+        const cEnd = child + cId.length + cSize.length + cSize.value;
+        if (cEnd > elementEnd) return null;
+        if (cId.id === DURATION_ID) return { offset: child, length: cEnd - child };
+        child = cEnd;
+      }
+      return null;
+    }
+    pos = elementEnd;
+  }
+  return null;
+}
+
 function nextClusterId(bytes: Uint8Array, from: number): number {
   for (let i = from; i + 4 <= bytes.length; i++) if (hasBytes(bytes, i, CLUSTER_ID)) return i;
   return -1;
@@ -121,11 +176,21 @@ export function parseWebmAudio(bytes: Uint8Array): ParsedWebmAudio | null {
   return { initLength, clusters };
 }
 
-/** Init part + the given clusters, timecodes rewritten so the first is 0. Input is not modified. */
+/**
+ * Init part + the given clusters, timecodes rewritten so the first is 0. Input is not modified.
+ * The init part's Duration (the whole video's length) is replaced by a Void element of the same
+ * length, so a decoder reports the window's own length.
+ */
 export function buildWindowFile(bytes: Uint8Array, parsed: ParsedWebmAudio, clusters: WebmCluster[]): Uint8Array {
   const total = clusters.reduce((n, c) => n + c.length, parsed.initLength);
   const out = new Uint8Array(total);
   out.set(bytes.subarray(0, parsed.initLength), 0);
+  const duration = findDuration(bytes, parsed.initLength);
+  if (duration && duration.length >= 2 && duration.length - 2 <= 126) {
+    out.fill(0, duration.offset, duration.offset + duration.length);
+    out[duration.offset] = VOID_ID;
+    out[duration.offset + 1] = 0x80 | (duration.length - 2);
+  }
   const base = clusters.length ? clusters[0].timecodeMs : 0;
   let at = parsed.initLength;
   for (const c of clusters) {

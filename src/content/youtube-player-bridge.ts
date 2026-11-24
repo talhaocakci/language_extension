@@ -12,7 +12,7 @@ import {
   PLAYER_TRACK_ATTRIBUTE,
 } from '../utils/youtube-timedtext';
 import type { AudioCaptureState, AudioWindowMessage } from '../utils/youtube-timedtext';
-import { decideAudioSync, installAudioCapture } from './youtube-audio-capture';
+import { decideAudioSync, installAudioCapture, isLiveVideo } from './youtube-audio-capture';
 import type { AudioSyncPrevious } from './youtube-audio-capture';
 
 const PUBLISH_INTERVAL_MS = 1000;
@@ -85,7 +85,7 @@ function currentVideoId(player: any): string {
  * Brings the capture in line with the player's current video. Used by the publisher and by the request
  * handler, so audio of another video is never served under the new id.
  */
-function syncAudio(player: any): { videoId: string; known: boolean; hasCaptions: boolean } | null {
+function syncAudio(player: any): { videoId: string; known: boolean; hasCaptions: boolean; live: boolean } | null {
   const videoId = currentVideoId(player);
   if (!player || !videoId) return null;
   const response = player.getPlayerResponse?.();
@@ -96,11 +96,12 @@ function syncAudio(player: any): { videoId: string; known: boolean; hasCaptions:
     generation: capture.generation(),
     responseVideoId: typeof responseVideoId === 'string' ? responseVideoId : null,
     captionTrackCount: Array.isArray(tracks) ? tracks.length : 0,
+    live: isLiveVideo(response?.videoDetails),
   });
   if (decision.resetCapture) capture.reset();
   if (decision.setEnabled !== null) capture.setEnabled(decision.setEnabled);
   lastSync = { videoId, generation: capture.generation() };
-  return { videoId, known: decision.known, hasCaptions: decision.hasCaptions };
+  return { videoId, known: decision.known, hasCaptions: decision.hasCaptions, live: decision.live };
 }
 
 function readAudioState(): string {
@@ -109,13 +110,17 @@ function readAudioState(): string {
     const sync = syncAudio(player);
     if (!sync || !sync.known) return '';
 
+    const keeps = !sync.hasCaptions && !sync.live;
+    const endMs = keeps ? videoEndMs(player) : undefined;
     const state: AudioCaptureState = {
       videoId: sync.videoId,
       hasCaptions: sync.hasCaptions,
-      format: capture.format(),
-      windows: sync.hasCaptions
-        ? []
-        : capture.windows(videoEndMs(player)).map((w) => ({ index: w.index, startMs: w.startMs, partial: w.partial })),
+      format: sync.live ? 'unsupported' : capture.format(),
+      windows: keeps
+        ? capture.windows(endMs).map((w) => ({ index: w.index, startMs: w.startMs, partial: w.partial }))
+        : [],
+      capturedMs: keeps ? capture.lastClusterMs() : null,
+      endCaptured: endMs !== undefined,
     };
     return JSON.stringify(state);
   } catch {
@@ -143,9 +148,9 @@ document.addEventListener(AUDIO_WINDOW_REQUEST_EVENT, (event) => {
     if (!request || typeof request.requestId !== 'string' || !Number.isInteger(request.index)) return;
 
     const player = getPlayer();
-    syncAudio(player);
+    const sync = syncAudio(player);
     const videoId = currentVideoId(player);
-    const stale = typeof request.videoId === 'string' && request.videoId !== videoId;
+    const stale = (typeof request.videoId === 'string' && request.videoId !== videoId) || sync?.live === true;
     const endMs = videoEndMs(player);
     const window_ = stale ? undefined : capture.windows(endMs).find((w) => w.index === request.index);
     const bytes = window_ ? capture.windowFile(request.index, endMs) : null;

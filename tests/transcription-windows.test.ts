@@ -68,8 +68,37 @@ test('empty and invalid input yields nothing', () => {
 test('the window at the playhead goes first, stored and in-flight ones are skipped', () => {
   const ready = readyWindows(tc(0, 10001, 20001, 30001, 40001, 50001, 60001, 70001, 80001, 90001));
   assert.equal(nextWindowToSend(ready, new Set(), new Set(), 35_000)!.index, 1);
-  assert.equal(nextWindowToSend(ready, new Set([1]), new Set([2]), 35_000)!.index, 0);
+  assert.equal(nextWindowToSend(ready, new Set([1]), new Set([2]), 35_000), null); // never behind the playhead
   assert.equal(nextWindowToSend(ready, new Set([0, 1, 2]), new Set(), 0), null);
+});
+test('after a late accept at minute 9 nothing below the playhead window is sent', () => {
+  const ms = Array.from({ length: 70 }, (_, i) => i * 10_000 + (i > 0 ? 1 : 0)); // 0 .. 690 001
+  const ready = readyWindows(tc(...ms));
+  const playhead = 9 * 60_000 + 5_000; // window 18
+  const sent: number[] = [];
+  const done = new Set<number>();
+  for (let next = nextWindowToSend(ready, done, new Set(), playhead); next; next = nextWindowToSend(ready, done, new Set(), playhead)) {
+    sent.push(next.index);
+    done.add(next.index);
+  }
+  assert.ok(sent.length > 0);
+  assert.equal(sent[0], 18);
+  assert.ok(sent.every((i) => i >= 18));
+});
+test('a pending cluster of the next window makes a window ready without becoming part of it', () => {
+  assert.deepEqual(readyWindows(tc(0, 10001, 20001), undefined, 30001),
+    [{ index: 0, startMs: 0, partial: false, clusterIndexes: [0, 1, 2] }]);
+});
+test('a pending cluster after a gap makes the window ready and partial', () => {
+  const ready = readyWindows(tc(0, 10001, 20001), undefined, 40001);
+  assert.deepEqual(ready.map(w => [w.index, w.partial, w.clusterIndexes]), [[0, true, [0, 1, 2]]]);
+});
+test('a pending cluster in the same window or not later than the kept ones changes nothing', () => {
+  assert.deepEqual(readyWindows(tc(0, 10001), undefined, 20001), []);
+  assert.deepEqual(readyWindows(tc(0, 10001, 20001), undefined, 10001), []);
+  assert.deepEqual(readyWindows(tc(0, 10001, 20001, 30001), undefined, 40001),
+    readyWindows(tc(0, 10001, 20001, 30001)));
+  assert.deepEqual(readyWindows([], undefined, 30001), []);
 });
 test('a sentence crossing a window edge is whole once both windows are in', () => {
   const w0 = words('Das ist der Anfang. Und hier', 27_000, 30_000);

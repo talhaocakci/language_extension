@@ -73,6 +73,20 @@ export function shouldRetryTranscribe(status: number, json: unknown): boolean {
   return true;
 }
 
+/**
+ * Whether the service worker sends a window again after the first attempt. status null: no HTTP
+ * response (network error). A complete window is safe to send again (the server serves a repeat from
+ * its cache); a partial one is transcribed and charged again, so it is retried only when the server
+ * certainly did not transcribe it (502 transcription_failed). A lost response, 500 or 503 charge_failed
+ * may have transcribed a partial window and are not retried.
+ */
+export function shouldRetryAttempt(partial: boolean, status: number | null, json: unknown): boolean {
+  if (status === null) return !partial;
+  if (!shouldRetryTranscribe(status, json)) return false;
+  if (!partial) return true;
+  return status === 502 && isRecord(json) && json.error === 'transcription_failed';
+}
+
 export function bytesToBase64(bytes: Uint8Array): string {
   const CHUNK = 0x8000;
   let binary = '';

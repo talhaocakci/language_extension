@@ -7,7 +7,7 @@
 
 import { readyWindows } from '../utils/transcription-windows';
 import type { ReadyWindow } from '../utils/transcription-windows';
-import { buildWindowFile, parseWebmAudio } from '../utils/webm-audio';
+import { buildWindowFile, clusterTimecodeAt, parseWebmAudio } from '../utils/webm-audio';
 
 export const MAX_KEPT_BYTES = 8 * 1024 * 1024;
 
@@ -21,6 +21,8 @@ export interface AudioCapture {
   format(): AudioFormat;
   /** Timecode of the newest kept cluster, or null when none is kept. */
   lastClusterMs(): number | null;
+  /** Timecode of the cluster still arriving, once its header (id, size, Timecode) is in; otherwise null. */
+  pendingClusterMs(): number | null;
   /** Drop kept clusters and unfinished bytes; the init part of the current buffer and the format stay. */
   reset(): void;
   /** While disabled nothing is kept. A new audio buffer keeps the current flag. */
@@ -36,6 +38,8 @@ export interface AudioSyncNow {
   /** Video the player response belongs to, or null when there is none yet. */
   responseVideoId: string | null;
   captionTrackCount: number;
+  /** The player response says the video is live (see isLiveVideo). */
+  live?: boolean;
 }
 export interface AudioSyncDecision {
   /** Drop the kept clusters. */
@@ -45,6 +49,21 @@ export interface AudioSyncDecision {
   /** False while the player response is not (yet) the current video's: publish "unknown". */
   known: boolean;
   hasCaptions: boolean;
+  /** A live video: nothing is kept and the format is published as 'unsupported'. */
+  live: boolean;
+}
+
+/**
+ * True for a live video: videoDetails.isLive is true, or videoDetails.isLiveContent is true and the
+ * video has no finite positive duration (lengthSeconds). A finished stream's replay is not live.
+ */
+export function isLiveVideo(videoDetails: unknown): boolean {
+  if (!videoDetails || typeof videoDetails !== 'object') return false;
+  const d = videoDetails as Record<string, unknown>;
+  if (d.isLive === true) return true;
+  if (d.isLiveContent !== true) return false;
+  const seconds = Number(d.lengthSeconds);
+  return !(Number.isFinite(seconds) && seconds > 0);
 }
 
 /**
@@ -55,9 +74,11 @@ export interface AudioSyncDecision {
 export function decideAudioSync(prev: AudioSyncPrevious | null, now: AudioSyncNow): AudioSyncDecision {
   const sameBufferNewVideo = prev !== null && prev.videoId !== now.videoId && prev.generation === now.generation;
   const known = now.responseVideoId === now.videoId;
-  if (!known) return { resetCapture: sameBufferNewVideo, setEnabled: null, known: false, hasCaptions: false };
+  if (!known) return { resetCapture: sameBufferNewVideo, setEnabled: null, known: false, hasCaptions: false, live: false };
   const hasCaptions = now.captionTrackCount > 0;
-  return { resetCapture: sameBufferNewVideo || hasCaptions, setEnabled: !hasCaptions, known: true, hasCaptions };
+  const live = now.live === true;
+  const keep = !hasCaptions && !live;
+  return { resetCapture: sameBufferNewVideo || !keep, setEnabled: keep, known: true, hasCaptions, live };
 }
 
 export type CaptureWrapperName = 'addSourceBuffer' | 'appendBuffer' | 'abort' | 'changeType';
@@ -206,7 +227,7 @@ class AudioStore {
   }
 
   windows(videoEndMs?: number): ReadyWindow[] {
-    return readyWindows(this.clusters, videoEndMs);
+    return readyWindows(this.clusters, videoEndMs, this.pendingClusterMs() ?? undefined);
   }
 
   windowFile(index: number, videoEndMs?: number): Uint8Array | null {
@@ -221,6 +242,12 @@ class AudioStore {
 
   lastClusterMs(): number | null {
     return this.clusters.length ? this.clusters[this.clusters.length - 1].timecodeMs : null;
+  }
+
+  /** The unfinished bytes start at a cluster id once clusters are being kept; reads only its header. */
+  pendingClusterMs(): number | null {
+    if (!this.init || !this.enabled) return null;
+    return clusterTimecodeAt(this.pending, 0);
   }
 }
 
@@ -322,6 +349,7 @@ export function installAudioCapture(
     windowFile: (index, videoEndMs) => store.windowFile(index, videoEndMs),
     format: () => format,
     lastClusterMs: () => store.lastClusterMs(),
+    pendingClusterMs: () => store.pendingClusterMs(),
     reset: () => store.reset(),
     setEnabled: (value) => store.setEnabled(value),
     generation: () => generation,

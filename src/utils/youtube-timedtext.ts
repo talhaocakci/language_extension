@@ -150,6 +150,10 @@ export interface AudioCaptureState {
   hasCaptions: boolean;
   format: 'webm-opus' | 'unsupported' | '';
   windows: { index: number; startMs: number; partial: boolean }[];
+  /** Timecode of the last complete kept cluster, or null when none is kept. */
+  capturedMs: number | null;
+  /** The kept audio reaches the video's end. */
+  endCaptured: boolean;
 }
 
 export function parseAudioCaptureState(raw: string | null | undefined): AudioCaptureState | null {
@@ -164,7 +168,13 @@ export function parseAudioCaptureState(raw: string | null | undefined): AudioCap
       if (!w || typeof w.index !== 'number' || typeof w.startMs !== 'number' || typeof w.partial !== 'boolean') return null;
       windows.push({ index: w.index, startMs: w.startMs, partial: w.partial });
     }
-    return { videoId: value.videoId, hasCaptions: value.hasCaptions, format: value.format, windows };
+    // Both fields are optional on the wire: a state from an older bridge has neither.
+    const rawCaptured = value.capturedMs ?? null;
+    if (rawCaptured !== null && (typeof rawCaptured !== 'number' || !Number.isFinite(rawCaptured) || rawCaptured < 0)) return null;
+    const capturedMs = rawCaptured as number | null;
+    const endCaptured = value.endCaptured ?? false;
+    if (typeof endCaptured !== 'boolean') return null;
+    return { videoId: value.videoId, hasCaptions: value.hasCaptions, format: value.format, windows, capturedMs, endCaptured };
   } catch {
     return null;
   }
