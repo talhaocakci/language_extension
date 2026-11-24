@@ -3,6 +3,9 @@ import test from 'node:test';
 import {
   BUSY_RETRY_MAX_MS,
   BUSY_RETRY_MS,
+  CATCH_UP_MIN_MS,
+  CATCH_UP_SEEK_JUMP_MS,
+  SubtitleCatchUp,
   LAST_WINDOW_SETTLE_MS,
   STALE_SENTENCE_MS,
   busyRetryDelayMs,
@@ -671,6 +674,79 @@ test('pickTranscribedSentence shows the current sentence and drops one that ende
   assert.equal(pickTranscribedSentence(list, 12_000), list[1]);
   assert.equal(pickTranscribedSentence(list, 5 * 60_000), null);
   assert.equal(pickTranscribedSentence(list, 0), null); // nothing started yet
+});
+
+// ── Catching up after the wait ───────────────────────────────────────────────
+
+test('catch-up takes the video back to where the wait for subtitles began', () => {
+  const c = new SubtitleCatchUp();
+  const all = () => true;
+  assert.equal(c.observe('offer', 2000, all), null);
+  assert.equal(c.observe('preparing', 2100, all), null); // accepted here
+  assert.equal(c.waiting(), true);
+  assert.equal(c.observe('preparing', 5000, all), null);
+  assert.equal(c.observe('preparing', 9000, all), null);
+  assert.equal(c.observe('ready', 10_000, all), 2100);
+  assert.equal(c.waiting(), false);
+  assert.equal(c.observe('ready', 2100, all), null); // only once
+  assert.equal(c.observe('ready', 2300, all), null);
+});
+
+test('catch-up leaves the video alone when almost nothing played during the wait', () => {
+  const c = new SubtitleCatchUp();
+  c.observe('preparing', 5000, () => true); // paused, or the subtitles came at once
+  assert.equal(c.observe('ready', 5000 + CATCH_UP_MIN_MS - 1, () => true), null);
+});
+
+test('catch-up follows the learner when they seek during the wait', () => {
+  const c = new SubtitleCatchUp();
+  const all = () => true;
+  c.observe('preparing', 2000, all);
+  c.observe('preparing', 3000, all);
+  c.observe('preparing', 3000 + CATCH_UP_SEEK_JUMP_MS + 1, all); // seeked forward: wait restarts there
+  c.observe('preparing', 9000, all);
+  assert.equal(c.observe('ready', 10_000, all), 3000 + CATCH_UP_SEEK_JUMP_MS + 1);
+
+  c.observe('preparing', 50_000, all);
+  c.observe('preparing', 52_000, all);
+  c.observe('preparing', 49_000, all); // stepped back before where the wait began
+  c.observe('preparing', 52_000, all);
+  assert.equal(c.observe('ready', 54_000, all), 49_000);
+
+  c.observe('preparing', 60_000, all);
+  c.observe('preparing', 62_000, all);
+  assert.equal(c.observe('ready', 200_000, all), null); // seeked into a ready part: stay there
+});
+
+test('catch-up forgets the wait when transcription stops or is reset', () => {
+  const c = new SubtitleCatchUp();
+  const all = () => true;
+  c.observe('preparing', 2000, all);
+  c.observe('no_credits', 4000, all);
+  assert.equal(c.observe('ready', 6000, all), null);
+  c.observe('preparing', 6000, all);
+  c.reset();
+  assert.equal(c.observe('ready', 9000, all), null);
+});
+
+test('catch-up goes back only as far as the subtitles reach', () => {
+  const c = new SubtitleCatchUp();
+  const onlyWindow1 = (ms: number) => Math.floor(ms / WINDOW_MS) === 1;
+  c.observe('preparing', 27_000, onlyWindow1);
+  c.observe('preparing', 30_500, onlyWindow1);
+  assert.equal(c.observe('ready', 33_000, onlyWindow1), WINDOW_MS);
+  c.observe('preparing', 27_000, onlyWindow1);
+  c.observe('preparing', 29_500, onlyWindow1);
+  assert.equal(c.observe('ready', 30_500, onlyWindow1), null); // half a second into the window: not worth a jump
+  c.observe('preparing', 2000, () => false);
+  assert.equal(c.observe('ready', 5000, () => false), null);
+});
+
+test('windowDoneAt tells whether the window at a position is transcribed', async () => {
+  const f = fake({ stored: [win(1, 'Eins zwei drei.')], windows: [] }); const c = new TranscriptionController(f.deps, () => {});
+  c.reset('v1'); c.setActive(true); c.setWanted(true); await f.settled();
+  assert.equal(c.windowDoneAt(WINDOW_MS + 5), true);
+  assert.equal(c.windowDoneAt(5), false);
 });
 
 // ── Window file request ──────────────────────────────────────────────────────

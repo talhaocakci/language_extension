@@ -59,6 +59,51 @@ export function pickTranscribedSentence(sentences: MeaningfulSentence[], playhea
   if (chosen.startTime > playheadMs + SENTENCE_START_LEAD_MS) return null; // nothing has started yet
   return chosen.endTime < playheadMs - STALE_SENTENCE_MS ? null : chosen;
 }
+/** The video is taken back only when at least this much played without subtitles. */
+export const CATCH_UP_MIN_MS = 1500;
+/** A playhead change this large between two observations is the learner seeking, not playback. */
+export const CATCH_UP_SEEK_JUMP_MS = 4000;
+
+/**
+ * Subtitles become ready some seconds after they are asked for, while the video keeps playing (a paused
+ * player stops downloading audio). This remembers where the wait began, so the video can be taken back
+ * there once the subtitles exist and the learner misses nothing.
+ */
+export class SubtitleCatchUp {
+  private anchorMs: number | null = null;
+  private lastMs = 0;
+
+  /**
+   * Call on every overlay refresh. Returns the position to seek back to, once, when the wait is over;
+   * otherwise null. `covered` says whether the window holding a position has been transcribed.
+   */
+  observe(phase: TranscriptionPhase, playheadMs: number, covered: (ms: number) => boolean): number | null {
+    const jumped = Math.abs(playheadMs - this.lastMs) > CATCH_UP_SEEK_JUMP_MS;
+    this.lastMs = playheadMs;
+    if (phase === 'preparing') {
+      if (this.anchorMs === null || jumped || playheadMs < this.anchorMs) this.anchorMs = playheadMs;
+      return null;
+    }
+    const anchor = this.anchorMs;
+    this.anchorMs = null;
+    if (phase !== 'ready' || anchor === null || jumped) return null;
+    if (playheadMs - anchor < CATCH_UP_MIN_MS) return null;
+    if (covered(anchor)) return anchor;
+    // The wait began in a window that was never transcribed: go back as far as the subtitles reach.
+    const windowStart = Math.floor(playheadMs / WINDOW_MS) * WINDOW_MS;
+    return windowStart > anchor && playheadMs - windowStart >= CATCH_UP_MIN_MS && covered(windowStart) ? windowStart : null;
+  }
+
+  /** True while a wait is being tracked. */
+  waiting(): boolean {
+    return this.anchorMs !== null;
+  }
+
+  reset(): void {
+    this.anchorMs = null;
+  }
+}
+
 const NO_SENTENCES: MeaningfulSentence[] = [];
 type StickyPhase = 'unavailable' | 'no_credits' | 'signed_out';
 
@@ -135,6 +180,11 @@ export class TranscriptionController {
       (s.startTime <= playhead && playhead <= s.endTime) ||
       (s.startTime > playhead && s.startTime - playhead <= COVER_AHEAD_MS)
     );
+  }
+
+  /** True when the window holding this position has been transcribed (or was stored). */
+  windowDoneAt(ms: number): boolean {
+    return !this.blocked() && this.done.has(Math.floor(ms / WINDOW_MS));
   }
 
   /**

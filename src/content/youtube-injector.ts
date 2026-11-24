@@ -19,7 +19,7 @@ import {
   type PlayerTrackState
 } from '../utils/youtube-timedtext';
 import { bytesToBase64, type TranscribeResult } from '../utils/transcript-api';
-import { TranscriptionController, pickTranscribedSentence, type TranscriptionPhase } from './youtube-transcription';
+import { SubtitleCatchUp, TranscriptionController, pickTranscribedSentence, type TranscriptionPhase } from './youtube-transcription';
 import { browserWindowFileEnv, requestAudioWindowFile } from './audio-window-request';
 import {
   BROWSER_EXTENSION_PREFERENCES_STORAGE_KEY,
@@ -2436,6 +2436,12 @@ function renderYouTubeOverlay(): void {
   }
 
   const transcriptionPhase = transcription.phase();
+  // Subtitles asked for mid-playback arrive a few seconds later: take the video back so none are missed.
+  const catchUpMs = transcriptionCatchUp.observe(transcriptionPhase, currentTimeMs, (ms) => transcription.windowDoneAt(ms));
+  if (catchUpMs !== null && videoElement) {
+    videoElement.currentTime = catchUpMs / 1000;
+    return;
+  }
   if (transcriptionPhase !== 'idle') {
     syncTranscriptionSentences();
     if (shouldShowTranscriptionStatus(transcriptionPhase)) {
@@ -2633,6 +2639,7 @@ let alwaysTranscribeCaptionless = false;
 let transcriptionAutoAcceptedVideoId = '';
 let transcriptionAppliedSentences: MeaningfulSentence[] | null = null;
 const transcriptionWindowFileEnv = browserWindowFileEnv();
+const transcriptionCatchUp = new SubtitleCatchUp();
 
 /** Resolves the service worker's answer, or undefined on rejection, no answer, or timeout. */
 function sendRuntimeMessageWithTimeout(message: MessageRequest, timeoutMs: number): Promise<any> {
@@ -2754,7 +2761,9 @@ function syncTranscriptionSentences(): void {
 function renderTranscriptionStatus(phase: TranscriptionPhase): void {
   // A paused player stops downloading audio, so nothing can be prepared until it plays.
   const waitingForPlay = phase === 'preparing' && getVideoElement()?.paused === true;
-  const key = `transcription|${phase}|${waitingForPlay}`;
+  // While it plays through the wait, say that nothing will be missed.
+  const willJumpBack = phase === 'preparing' && !waitingForPlay && transcriptionCatchUp.waiting();
+  const key = `transcription|${phase}|${waitingForPlay}|${willJumpBack}`;
   if (key === overlayLastSentenceKey && !overlayHidden) {
     const now = performance.now();
     if (now - overlayLastAnchorSyncTimeMs >= 350) {
@@ -2788,7 +2797,9 @@ function renderTranscriptionStatus(phase: TranscriptionPhase): void {
   const text = document.createElement('div');
   text.textContent = waitingForPlay
     ? 'Press play: subtitles appear a few seconds after the video starts playing.'
-    : transcriptionStatusText(phase);
+    : willJumpBack
+      ? 'Preparing subtitles… the video will jump back here when they are ready.'
+      : transcriptionStatusText(phase);
   if (phase === 'signed_out') text.style.color = '#ffcccb';
   box.appendChild(text);
   if (phase === 'offer') {
@@ -2867,6 +2878,7 @@ function handleTranscriptionChange(): void {
 function resetTranscriptionForVideo(videoId: string): void {
   transcriptionAppliedSentences = null;
   transcriptionAutoAcceptedVideoId = '';
+  transcriptionCatchUp.reset();
   transcription.reset(videoId); // also forgets that the learner wanted this video
   transcription.setActive(overlayEnabled);
 
